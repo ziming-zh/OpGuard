@@ -70,6 +70,53 @@ def test_q_norm_case_pivots_on_both_sides():
     assert len(report["near_links"]) == 1
 
 
+CKPT = [901, 902, 903, 904]
+W_VLLM = [701, 702, 703, 704]
+W_OLD = [701, 799, 703, 704]   # same weights, packed differently: 3 of 4 regions equal
+FUSED = [601, 602, 603, 604]
+
+
+def with_weight_load():
+    """Weight loading first (narrow vs cat: a packing difference), then the q_norm case."""
+    vllm = [("vllm/narrow:0", rec(163, "<torch.narrow>", "/work/runtime/vllm/loader.py", 40,
+                                  {"args": [t([8192, 4096], CKPT)]}, t([4096, 4096], W_VLLM)))]
+    qkv = vllm_side()
+    qkv[0][1]["inputs"]["args"].append(t([4096, 4096], W_VLLM))
+    old = [("old/cat:0", rec(44, "<torch.cat>", "/work/training/p3/load.py", 12,
+                             {"args": [[t([8192, 4096], CKPT)]]}, t([4096, 4096], W_OLD))),
+           ("old/linear:0", rec(4300, "<torch.nn.functional.linear>", "/work/training/p3/model.py", 50,
+                                {"args": [t([38, 4096], HIDDEN), t([4096, 4096], W_OLD)]}, t([38, 4096], FUSED))),
+           ("old/split:0", rec(4301, "<torch.split>", "/work/training/p3/model.py", 51,
+                               {"args": [t([38, 4096], FUSED)]}, t([38, 4096], Q_IN))),
+           old_side()[1]]
+    return vllm + qkv, old
+
+
+def test_packing_difference_in_weight_load_is_set_aside():
+    report = vm.match_values(*with_weight_load())
+    assert report["pivot"]["left"]["record"] == "vllm/rms:35"
+    assert report["pivot"]["right"]["record"] == "old/float:0"
+    left_aside = report["set_aside"]["left"][0]
+    assert left_aside["record"] == "vllm/narrow:0"
+    assert left_aside["set_aside"]["reason"] == "diverged_value_rematches_downstream"
+    assert left_aside["set_aside"]["consumer"]["record"] == "vllm/qkv:0"
+    right_aside = report["set_aside"]["right"][0]
+    assert right_aside["record"] == "old/cat:0" and right_aside["set_aside"]["hops"] in (1, 2)
+
+
+def test_cli_counter_window(tmp_path):
+    for name, side in zip(("vllm", "old"), with_weight_load()):
+        for rid, record in side:
+            path = tmp_path / name / "gpu_000" / "ops" / (rid.split(":")[0].replace("/", "_") + ".jsonl")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+    report = vm.main([str(tmp_path / "vllm"), str(tmp_path / "old"),
+                      "--run1-from", "3191", "--run2-from", "4293"])
+    assert report["0"]["pivot"]["left"]["record"].endswith("vllm_rms.jsonl:0")
+    assert report["0"]["set_aside"]["left"] == []
+
+
 def test_identical_runs_have_no_pivot():
     report = vm.match_values(vllm_side(), vllm_side())
     assert report["pivot"] == {"left": None, "right": None}
@@ -114,3 +161,11 @@ def test_cli_reads_trace_dirs_across_files(tmp_path):
     report = vm.main([str(tmp_path / "vllm"), str(tmp_path / "old"), "--out", str(tmp_path / "r.json")])
     assert report["0"]["pivot"]["left"]["function"].endswith("rms_norm_batch_invariant>")
     assert report["0"]["pivot"]["right"]["function"] == "<None.float>"
+
+
+if __name__ == "__main__":
+    import tempfile
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn(Path(tempfile.mkdtemp())) if fn.__code__.co_argcount else fn()
+            print("PASS", name)

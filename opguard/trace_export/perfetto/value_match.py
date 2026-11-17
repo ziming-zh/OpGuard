@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 MIN_NUMEL = 64
+REMATCH_HOPS = 4  # how far along data flow a diverged value is followed
 
 ValueKey = Tuple[str, int, Tuple[int, ...]]
 
@@ -105,7 +106,10 @@ class _Side:
         self.outs = [_keys(rec.get("outputs")) for rec in self.records]
         self.producer: Dict[ValueKey, int] = {}
         self.first_seen: Dict[ValueKey, int] = {}
+        self.consumers: Dict[ValueKey, List[int]] = defaultdict(list)
         for i, (ins, outs) in enumerate(zip(self.ins, self.outs)):
+            for key in ins:
+                self.consumers[key].append(i)
             for key in outs:
                 self.producer.setdefault(key, i)
             for key in ins + outs:
@@ -178,17 +182,41 @@ def _key_json(key: ValueKey) -> dict:
     return {"dtype": key[0], "numel": key[1], "xor_signature": list(key[2])}
 
 
+def _rematch(side: _Side, other: _Side, keys: List[ValueKey], near, matched: set) -> Optional[dict]:
+    """A consumer of the diverged value (on either side) whose output matches both runs.
+
+    A real divergence propagates; a layout or packing difference (weights split
+    with narrow on one side, packed with cat on the other) is consumed into values
+    that agree again. Such a candidate is set aside, with this record as evidence.
+    """
+    for this, frontier in ((side, list(keys)), (other, [near[k][0] for k in keys if k in near])):
+        seen = set(frontier)
+        for hops in range(1, REMATCH_HOPS + 1):
+            nxt = []
+            for key in frontier:
+                for i in this.consumers.get(key, []):
+                    hit = [k for k in this.outs[i] if k in matched]
+                    if hit:
+                        return {"consumer": _describe(this, i), "rematched_value": _key_json(hit[0]),
+                                "side": "same" if this is side else "other", "hops": hops}
+                    nxt += [k for k in this.outs[i] if k not in seen]
+                    seen.update(this.outs[i])
+            frontier = nxt
+    return None
+
+
 def _pivot(side: _Side, other: _Side, matched: set, near: Dict[ValueKey, Tuple[ValueKey, List[int]]]):
-    candidates = []
+    candidates, set_aside = [], []
     seen_matched = False
     for i, (ins, outs) in enumerate(zip(side.ins, side.outs)):
         m = [k for k in ins if k in matched]
         u = [k for k in ins if k not in matched]
         u_uncaptured = [k for k in u if side.producer.get(k, i) >= i]
         out_unmatched = [k for k in outs if k not in matched]
-        found = None
+        found, diverged = None, []
         if m and len(u_uncaptured) == len(u) and out_unmatched:
             strong = [k for k in out_unmatched if k in near]
+            diverged = strong or out_unmatched
             found = {"kind": "operator", "strength": "near_counterpart" if strong else "unmatched_output",
                      "matched_inputs": [_key_json(k) for k in m],
                      "inputs_without_captured_producer": [_key_json(k) for k in u],
@@ -198,16 +226,22 @@ def _pivot(side: _Side, other: _Side, matched: set, near: Dict[ValueKey, Tuple[V
         elif seen_matched:
             upstream = [k for k in u_uncaptured if k in near]
             if upstream:
+                diverged = upstream
                 found = {"kind": "uncaptured_upstream", "strength": "near_counterpart",
                          "diverged": [_key_json(k) for k in upstream],
                          "counterpart": _counterparts(other, upstream, near)}
         if found:
             found.update(_describe(side, i))
-            candidates.append(found)
+            evidence = _rematch(side, other, diverged, near, matched)
+            if evidence:
+                found["set_aside"] = {"reason": "diverged_value_rematches_downstream", **evidence}
+                set_aside.append(found)
+            else:
+                candidates.append(found)
         seen_matched = seen_matched or bool(m) or any(k in matched for k in outs)
     strong = [c for c in candidates if c["strength"] == "near_counterpart"]
     pivot = strong[0] if strong else (candidates[0] if candidates else None)
-    return pivot, candidates[:5]
+    return pivot, candidates[:5], set_aside[:5]
 
 
 def _counterparts(other: _Side, keys: List[ValueKey], near) -> List[dict]:
@@ -228,8 +262,8 @@ def match_values(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, di
                       if k in L.producer and k in R.producer]
     kept, crossing = _monotone(producer_pairs)
     near = _near_links(L, R, matched)
-    left_pivot, left_candidates = _pivot(L, R, matched, near["left"])
-    right_pivot, right_candidates = _pivot(R, L, matched, near["right"])
+    left_pivot, left_candidates, left_aside = _pivot(L, R, matched, near["left"])
+    right_pivot, right_candidates, right_aside = _pivot(R, L, matched, near["right"])
     return {
         "method": "xor_value_match_v1",
         "evidence": "equal fingerprints of non-trivial tensors; unequal fingerprints are not evidence",
@@ -245,6 +279,7 @@ def match_values(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, di
                        for lk, (rk, diff) in near["left"].items()],
         "pivot": {"left": left_pivot, "right": right_pivot} if matched else None,
         "candidates": {"left": left_candidates, "right": right_candidates} if matched else None,
+        "set_aside": {"left": left_aside, "right": right_aside} if matched else None,
         "applicable": bool(matched),
     }
 
@@ -282,8 +317,19 @@ def main(argv=None):
     ap.add_argument("run1"); ap.add_argument("run2")
     ap.add_argument("--rank", type=int, action="append", help="limit to these ranks")
     ap.add_argument("--out", help="write the full JSON report here")
+    for run in ("run1", "run2"):
+        ap.add_argument(f"--{run}-from", type=int, help=f"only {run} records with counter >= this")
+        ap.add_argument(f"--{run}-to", type=int, help=f"only {run} records with counter <= this")
     args = ap.parse_args(argv)
-    a, b = load_dir(args.run1), load_dir(args.run2)
+
+    def window(by_rank, lo, hi):
+        def keep(rec):
+            c = rec.get("counter")
+            return not isinstance(c, int) or ((lo is None or c >= lo) and (hi is None or c <= hi))
+        return {r: [x for x in recs if keep(x[1])] for r, recs in by_rank.items()}
+
+    a = window(load_dir(args.run1), args.run1_from, args.run1_to)
+    b = window(load_dir(args.run2), args.run2_from, args.run2_to)
     ranks = sorted(set(a) & set(b)) if not args.rank else args.rank
     report = {str(r): match_values(a.get(r, []), b.get(r, [])) for r in ranks}
     if args.out:
@@ -295,6 +341,11 @@ def main(argv=None):
             print("  no shared values: runs not bitwise-aligned here; value fallback does not apply")
             continue
         for side in ("left", "right"):
+            for s in rep["set_aside"][side]:
+                ev = s["set_aside"]["consumer"]
+                print(f"  set aside[{'run1' if side == 'left' else 'run2'}]: {s['function']} counter={s['counter']} "
+                      f"(re-matches downstream at {ev['function']} counter={ev['counter']}, "
+                      f"{s['set_aside']['side']} side, {s['set_aside']['hops']} hop(s))")
             p = rep["pivot"][side]
             if p:
                 print(f"  pivot[{'run1' if side == 'left' else 'run2'}]: {p['kind']} ({p['strength']}) "
