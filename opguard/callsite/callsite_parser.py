@@ -12,6 +12,7 @@ from .ast_utils import (
     call_priority_kind_name,
     is_triton_kernel_call,
     dotted_name_from_ast,
+    is_conversion_tail,
 )
 
 class CallsiteParser:
@@ -201,13 +202,20 @@ class CallsiteParser:
         if stmt_node is None:
             return results
 
+        tails = set()
         for kind, name, node in self._iter_instrumentable_nodes(stmt_node):
             # ✅ FIX: pass stmt_node so tag extractor can see full context
             info = self._build_info(kind, name, node, stmt_node, source_text)
             results.append(info)
+            if is_conversion_tail(node):
+                tails.add(id(info))
 
-        # Deterministic ordering for reproducibility (priority, then position)
+        # Deterministic ordering for reproducibility (priority, then position).
+        # A dtype/layout tail wrapping another call goes behind every other candidate.
         def rank_key(ci):
+            return (id(ci) in tails,) + base_rank_key(ci)
+
+        def base_rank_key(ci):
             kind_rank = {
                 "triton_kernel": 0, "method": 1, "function": 2,
                 "augmented_operator": 3, "comparison": 4,

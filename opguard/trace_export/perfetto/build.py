@@ -23,6 +23,7 @@ from . import config
 from .types import Key, Item
 from .timeline import list_pairs, sort_records
 from .align import align_records
+from .value_match import match_values
 from .schedule import compute_global_schedule, shrink_global_idle
 from .scoring import compare_simple, detect_anomaly
 from .utils import (
@@ -100,6 +101,53 @@ def _collect_all_items_and_pairs(matched_sorted, only1, only2, base1, base2, fil
                 items.append(Item(key, _counter(node), node.get("gpu_rank", parse_rank_from_rel(rel)),
                                   False, None, unmatched_reason="no_corresponding_trace_file"))
     return nodes, items1, items2, map12, map21
+
+
+def _value_fallback(nodes, items1, items2):
+    """Value-match the records call-site pairing left unplaced, per rank, across files.
+
+    Adds evidence only: call-site pairs and diff statuses are not touched.
+    """
+    def by_rank(items):
+        out: Dict[int, list] = {}
+        for it in items:
+            if not it.matched:
+                out.setdefault(it.rank, []).append(it)
+        for lst in out.values():
+            lst.sort(key=lambda it: (_safe_counter(it.counter), it.key.rel, it.key.idx))
+        return out
+
+    left, right = by_rank(items1), by_rank(items2)
+    reports, notes = {}, {}
+    ids = {}
+    for rank in sorted(set(left) & set(right)):
+        seqs = []
+        for lst in (left[rank], right[rank]):
+            seq = []
+            for it in lst:
+                rid = _record_id(it.key); ids[rid] = it.key
+                seq.append((rid, nodes[it.key]))
+            seqs.append(seq)
+        rep = match_values(*seqs)
+        if not rep["applicable"]:
+            continue
+        reports[str(rank)] = rep
+        note = lambda rid: notes.setdefault(ids[rid], {})
+        for link in rep["links"]:
+            note(link["left"])["peer_record_id"] = link["right"]
+            note(link["right"])["peer_record_id"] = link["left"]
+        for nl in rep["near_links"]:
+            for a, b in (("left", "right"), ("right", "left")):
+                for role in ("producer", "first_seen"):
+                    mine, peer = nl[f"{a}_{role}"], nl[f"{b}_producer"] or nl[f"{b}_first_seen"]
+                    if mine and peer:
+                        note(mine["record"]).setdefault("near_peer_record_id", peer["record"])
+                        note(mine["record"])["differing_regions"] = nl["differing_regions"]
+        for side in ("left", "right"):
+            p = rep["pivot"][side]
+            if p:
+                note(p["record"])["pivot"] = {"kind": p["kind"], "strength": p["strength"]}
+    return reports, notes
 
 
 def _safe_counter(v: Optional[int]) -> int:
@@ -247,6 +295,12 @@ def build_perfetto(
             sorted(pairs, key=lambda pair: pair.rel), only1, only2, base1, base2, filter
         )
 
+    with _timed_step("Step 3b: Value-match fallback for unplaced records"):
+        value_reports, value_notes = _value_fallback(nodes, items1, items2)
+        for rank, rep in value_reports.items():
+            print(f"🔗 rank {rank}: value links={len(rep['links'])} near={len(rep['near_links'])} "
+                  f"pivots={[p['function'] for p in rep['pivot'].values() if p]}")
+
     # --- compute global schedule (strict per-run counter order + no overlaps)
     with _timed_step("Step 4: Computing global schedule"):
         ts1, ts2 = compute_global_schedule(
@@ -340,6 +394,14 @@ def build_perfetto(
                 args["anomaly"] = anom
             if event_kind:
                 args["event_kind"] = event_kind
+            if it.key in value_notes:
+                args["value_match"] = {"method": "xor_value_match_v1", "uses_output_values": True,
+                                       "validation": "unreviewed", **value_notes[it.key]}
+                if "pivot" in value_notes[it.key]:
+                    events.append({"name": "value_pivot", "cat": "opguard", "ph": "i", "s": "t",
+                                   "ts": int(ts_ticks * 1_000), "pid": pid, "tid": tid, "cname": C_FIRST,
+                                   "args": {"rank": rank, "record_id": args["record_id"],
+                                            **value_notes[it.key]["pivot"], "root_cause": "not_determined"}})
             args["__search"] = f"run:{it.key.side} rank:{rank} status:{status} fn:{node.get('function','')}"
 
             if status == "diff" and first_global is None:
@@ -421,7 +483,9 @@ def build_perfetto(
                 "semantic_validation": "unreviewed_candidates",
                 "assumptions": ["Corresponding execution order within each matched callsite/context.",
                                 "Input summaries used as anchors are not proof of tensor equality."],
-            }
+            },
+            # Fallback over records call-site pairing left unplaced; evidence only.
+            "valueMatch": value_reports,
         }
         with gzip.open(outp, "wb") as f:
             f.write(json.dumps(doc, ensure_ascii=False).encode("utf-8"))

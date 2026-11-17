@@ -29,6 +29,24 @@ def _load_deprioritized_funcs_from_env() -> Set[str]:
 # Default: only 'range' unless overridden via env
 DEPRIORITIZED_FUNCTIONS: Set[str] = {"range", "len", "zip"} | _load_deprioritized_funcs_from_env()
 
+# Methods that change dtype, layout or view but not the computed values. When one
+# wraps another call on the line (``norm(x).float()``), the operator is the inner
+# call: the tail is not chosen as the line's boundary while another candidate exists.
+CONVERSION_TAIL_METHODS: Set[str] = {
+    "float", "half", "bfloat16", "double", "to", "type", "contiguous", "clone", "detach",
+    "view", "view_as", "reshape", "reshape_as", "flatten", "squeeze", "unsqueeze",
+    "transpose", "permute", "t",
+} | {tok.strip() for tok in os.getenv("OPGUARD_CONVERSION_TAILS", "").split(",") if tok.strip()}
+
+
+def is_conversion_tail(call: ast.AST) -> bool:
+    """``<expr containing a call>.float()`` and similar dtype/layout-only tails."""
+    func = getattr(call, "func", None)
+    return (isinstance(call, ast.Call) and isinstance(func, ast.Attribute)
+            and func.attr in CONVERSION_TAIL_METHODS
+            and any(isinstance(n, ast.Call) for n in ast.walk(func.value)))
+
+
 def dotted_name_from_ast(expr: ast.AST) -> str:
     if isinstance(expr, ast.Name):
         return expr.id
