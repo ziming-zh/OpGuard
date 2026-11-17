@@ -232,6 +232,13 @@ def _pivot(side: _Side, other: _Side, matched: set, near: Dict[ValueKey, Tuple[V
                          "counterpart": _counterparts(other, upstream, near)}
         if found:
             found.update(_describe(side, i))
+            if found["kind"] == "operator":
+                computed = _computed(side, other, i, m, matched)
+            else:
+                computed = any(_computed(other, side, other.producer[near[k][0]],
+                                         [x for x in other.ins[other.producer[near[k][0]]] if x in matched], matched)
+                               for k in diverged if near[k][0] in other.producer)
+            found["upstream"] = "computed" if computed else "loaded_only"
             evidence = _rematch(side, other, diverged, near, matched)
             if evidence:
                 found["set_aside"] = {"reason": "diverged_value_rematches_downstream", **evidence}
@@ -239,9 +246,23 @@ def _pivot(side: _Side, other: _Side, matched: set, near: Dict[ValueKey, Tuple[V
             else:
                 candidates.append(found)
         seen_matched = seen_matched or bool(m) or any(k in matched for k in outs)
-    strong = [c for c in candidates if c["strength"] == "near_counterpart"]
-    pivot = strong[0] if strong else (candidates[0] if candidates else None)
-    return pivot, candidates[:5], set_aside[:5]
+    # Prefer a divergence in computation over one in loading: strong+computed,
+    # computed, strong, then anything. Order within a tier is trace order.
+    def tier(c):
+        return (c["upstream"] != "computed", c["strength"] != "near_counterpart")
+    pivot = min(candidates, key=tier) if candidates else None
+    ranked = sorted(candidates, key=tier)
+    return pivot, ranked[:5], set_aside[:5]
+
+
+def _computed(side: _Side, other: _Side, i: int, matched_inputs: List[ValueKey], matched: set) -> bool:
+    """Some matched input of record i was computed by a captured record, on either side.
+
+    Weights read from a checkpoint have no captured producer on either side;
+    activations do. This tells a divergence in computation from a difference in
+    how weights were loaded or packed, without needing their later use captured.
+    """
+    return any(side.producer.get(k, i) < i or k in other.producer for k in matched_inputs)
 
 
 def _counterparts(other: _Side, keys: List[ValueKey], near) -> List[dict]:
@@ -348,7 +369,7 @@ def main(argv=None):
                       f"{s['set_aside']['side']} side, {s['set_aside']['hops']} hop(s))")
             p = rep["pivot"][side]
             if p:
-                print(f"  pivot[{'run1' if side == 'left' else 'run2'}]: {p['kind']} ({p['strength']}) "
+                print(f"  pivot[{'run1' if side == 'left' else 'run2'}]: {p['kind']} ({p['strength']}, upstream {p['upstream']}) "
                       f"{p['function']} {p['file']}:{p['line']} counter={p['counter']} record={p['record']}")
                 for c in p.get("counterpart", []):
                     q = c["producer"] or c["first_seen"]

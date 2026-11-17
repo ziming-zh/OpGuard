@@ -104,6 +104,44 @@ def test_packing_difference_in_weight_load_is_set_aside():
     assert right_aside["record"] == "old/cat:0" and right_aside["set_aside"]["hops"] in (1, 2)
 
 
+def loaded_weights_untraceable():
+    """As on the real traces: weight-load candidates whose later use is not captured.
+
+    vLLM narrow reads a loaded slice (no captured producer) and outputs nothing
+    usable; old cat packs the checkpoint and only to/copy_ follow with the same
+    value. No consumer chain reaches a shared value, so re-matching cannot help.
+    """
+    vllm = [("vllm/load:0", rec(100, "<safetensors.get>", "/work/runtime/vllm/loader.py", 30,
+                                {"args": [t([8192, 4096], CKPT)]}, None)),
+            ("vllm/narrow:0", rec(163, "<torch.narrow>", "/work/runtime/vllm/loader.py", 40,
+                                  {"args": [t([4096, 4096], W_VLLM)]}, None))] + vllm_side()
+    old = [("old/cat:0", rec(44, "<torch.cat>", "/work/training/p3/load.py", 12,
+                             {"args": [[t([8192, 4096], CKPT)]]}, t([4096, 4096], W_OLD))),
+           ("old/to:0", rec(45, "<None.to>", "/work/training/p3/load.py", 13,
+                            {"self": t([4096, 4096], W_OLD)}, t([4096, 4096], W_OLD))),
+           ("old/copy:0", rec(46, "<None.copy_>", "/work/training/p3/load.py", 14,
+                              {"args": [t([4096, 4096], W_OLD)]}, t([4096, 4096], W_OLD)))] + old_side()
+    return vllm, old
+
+
+def test_loaded_only_candidates_rank_below_computed_ones():
+    report = vm.match_values(*loaded_weights_untraceable())
+    left, right = report["pivot"]["left"], report["pivot"]["right"]
+    assert left["record"] == "vllm/rms:35" and left["upstream"] == "computed"
+    assert right["record"] == "old/float:0" and right["upstream"] == "computed"
+    # The weight-load candidates are still reported, ranked after the pivot.
+    assert {c["record"] for c in report["candidates"]["left"]} >= {"vllm/narrow:0"}
+    assert {c["record"] for c in report["candidates"]["right"]} >= {"old/cat:0"}
+    assert all(c["upstream"] == "loaded_only" for c in report["candidates"]["right"][1:])
+
+
+def test_loaded_only_candidate_is_still_reported_when_nothing_else_is():
+    vllm, old = loaded_weights_untraceable()
+    report = vm.match_values(vllm[:2], old[:3])
+    assert report["pivot"]["right"]["record"] == "old/cat:0"
+    assert report["pivot"]["right"]["upstream"] == "loaded_only"
+
+
 def test_cli_counter_window(tmp_path):
     for name, side in zip(("vllm", "old"), with_weight_load()):
         for rid, record in side:
