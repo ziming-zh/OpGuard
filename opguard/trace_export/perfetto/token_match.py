@@ -44,6 +44,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .value_match import _tensors, load_dir
 
 Ident = Tuple[int, int]          # (forward id, row index at the forward's start)
+Key = Tuple[int, str, int]       # (elements per token, dtype, merged row XOR)
 MARKER = "<opguard.forward>"
 CONFIRM_HOPS = 4                 # how far downstream a candidate is followed
 
@@ -81,8 +82,9 @@ def _leading(shape: List[int], n: int) -> Optional[int]:
     return None
 
 
-def _token_rows(t: dict, T: int) -> Optional[List[int]]:
-    """One fingerprint per token, merged from the tensor's vector XORs."""
+def _token_rows(t: dict, T: int):
+    """Per token: (key, vectors). key = (elements per token, dtype, merged XOR), so rows
+    of different widths never alias; vectors are the per-vector XORs (e.g. heads)."""
     st, shape = t["stats"], _shape(t)
     raw = st.get("xor_rows")
     if raw is None or shape is None:
@@ -93,12 +95,14 @@ def _token_rows(t: dict, T: int) -> Optional[List[int]]:
     if k is None or len(raw) != _prod(shape[:-1]):
         return None
     per = _prod(shape[k:-1])
+    width, dtype = _prod(shape[k:]), _dtype(t)
     rows = []
     for i in range(T):
+        vecs = tuple(int(v) & 0xFFFFFFFF for v in raw[i * per:(i + 1) * per])
         acc = 0
-        for v in raw[i * per:(i + 1) * per]:
-            acc ^= int(v) & 0xFFFFFFFF
-        rows.append(acc)
+        for v in vecs:
+            acc ^= v
+        rows.append(((width, dtype, acc), vecs))
     return rows
 
 
@@ -131,6 +135,7 @@ class _Side:
         markers = any(rec.get("function") == MARKER for rec in self.records)
         plan = sorted(forwards or [], key=lambda x: x["counter"])
         self.forward_source = "list" if plan else "markers" if markers else "inferred"
+        self.vecs: Dict[Key, Tuple[int, ...]] = {}
         f, T, seen, k = -1, None, {}, 0
         for r, rec in enumerate(self.records):
             n = None
@@ -152,23 +157,25 @@ class _Side:
                 if rows is None:
                     continue
                 ids = []
-                for i, sig in enumerate(rows):
-                    prev = seen.get(sig)
+                for i, (key, vecs) in enumerate(rows):
+                    prev = seen.get(key)
                     ident = prev if prev not in (None, "ambiguous") else (f, i)
                     ids.append(ident)
-                    if sig:
-                        self.ins[r].append((ident, sig))
+                    if key[2]:
+                        self.ins[r].append((ident, key))
+                        self.vecs.setdefault(key, vecs)
                 if in_ids is None:
                     in_ids = ids
             for t in _tensors(rec.get("outputs")):
                 rows = _token_rows(t, T)
                 if rows is None:
                     continue
-                for i, sig in enumerate(rows):
+                for i, (key, vecs) in enumerate(rows):
                     ident = in_ids[i] if in_ids is not None else (f, i)
-                    if sig:
-                        self.outs[r].append((ident, sig))
-                        seen[sig] = ident if seen.get(sig, ident) == ident else "ambiguous"
+                    if key[2]:
+                        self.outs[r].append((ident, key))
+                        self.vecs.setdefault(key, vecs)
+                        seen[key] = ident if seen.get(key, ident) == ident else "ambiguous"
         self.sigs: Dict[Ident, set] = defaultdict(set)
         self.owners: Dict[int, set] = defaultdict(set)
         self.producer: Dict[Tuple[Ident, int], int] = {}
@@ -207,70 +214,123 @@ def _links(L: _Side, R: _Side) -> List[Tuple[Ident, Ident]]:
     return sorted((a, b) for a, (n, b) in best_l.items() if best_r.get(b, (0, None))[1] == a)
 
 
-def _confirm(side: _Side, r: int, ident: Ident, out_sig: int, P: set):
-    """Follow the token's row downstream along data dependencies on this side."""
-    frontier, seen, consumed = [(r, out_sig)], {out_sig}, False
-    for _ in range(CONFIRM_HOPS):
-        nxt = []
-        for r0, sig in frontier:
-            for r2 in side.consumers.get((ident, sig), []):
-                if r2 <= r0:
+def _confirm(side: _Side, r: int, ident: Ident, out_key: Key, P: set):
+    """Follow the token's row downstream on this side. Value-preserving consumers
+    (output == input key, e.g. views) are passed through without counting; the
+    candidate is confirmed only if a value-changing consumer still disagrees."""
+    frontier, seen, changed, steps = [(r, out_key, 0)], {(r, out_key)}, False, 0
+    while frontier and steps < 4096:
+        r0, key, hops = frontier.pop(0)
+        steps += 1
+        for r2 in side.consumers.get((ident, key), []):
+            if r2 <= r0:
+                continue
+            for i2, o2 in side.outs[r2]:
+                if i2 != ident:
                     continue
-                consumed = True
-                for i2, o2 in side.outs[r2]:
-                    if i2 != ident:
-                        continue
-                    if o2 in P:
-                        return "set_aside", r2      # agreement returned: one-sided op
-                    if o2 not in seen:
-                        seen.add(o2)
-                        nxt.append((r2, o2))
-        frontier = nxt
-        if not frontier:
-            break
-    return ("confirmed" if consumed else "unconfirmed"), None
+                if o2 in P:
+                    return "set_aside", r2          # agreement returned: one-sided or fused-away step
+                h2 = hops if o2 == key else hops + 1
+                changed = changed or o2 != key
+                if h2 <= CONFIRM_HOPS and (r2, o2) not in seen:
+                    seen.add((r2, o2))
+                    frontier.append((r2, o2, h2))
+    return ("confirmed" if changed else "unconfirmed"), None
+
+
+def _near(vecs: Optional[Tuple[int, ...]], key: Key, other: _Side, pid: Ident):
+    """A row of the partner token with the same width and dtype that shares most of
+    its vectors with this one and differs in a few: the same tensor, diverged."""
+    if not vecs or len(vecs) < 2:
+        return None
+    best = None
+    for k2 in other.sigs[pid]:
+        if k2[:2] != key[:2] or k2 == key:
+            continue
+        v2 = other.vecs.get(k2)
+        if not v2 or len(v2) != len(vecs):
+            continue
+        diff = [i for i, (a, b) in enumerate(zip(vecs, v2)) if a != b]
+        if 0 < len(diff) * 2 <= len(vecs) and (best is None or len(diff) < len(best[1])):
+            best = (k2, diff)
+    return best
+
+
+def _pair(side: _Side, other: _Side, ident: Ident, pid: Ident, in_keys, out_key: Key, bad_in) -> Optional[dict]:
+    """Positive evidence from the other side that this is a divergence, not a gap."""
+    mine = side.sigs[ident]
+    if bad_in is None:
+        # (a) the other side ran the same input row and got a different output of the same width
+        for k in in_keys:
+            for r2 in other.consumers.get((pid, k), []):
+                outs = [o for i, o in other.outs[r2] if i == pid and o[:2] == out_key[:2]]
+                if outs and all(o not in mine for o in outs):
+                    item = {"by": "same_input", "other_record": other.describe(r2)}
+                    nm = _near(side.vecs.get(out_key), out_key, other, pid)
+                    if nm:
+                        item.update(differing_vectors=nm[1][:16], vectors=len(side.vecs[out_key]))
+                    return item
+    # (b) the diverged row itself is held by the other side, with a few vectors differing
+    probe = bad_in if bad_in is not None else out_key
+    nm = _near(side.vecs.get(probe), probe, other, pid)
+    if nm:
+        r2 = other.producer.get((pid, nm[0]))
+        if r2 is None:
+            r2 = min(other.consumers.get((pid, nm[0]), [None]) or [None], key=lambda x: x if x is not None else 1 << 60)
+        return {"by": "near_match", "other_record": other.describe(r2),
+                "differing_vectors": nm[1][:16], "vectors": len(side.vecs[probe])}
+    return None
 
 
 def _analyze(side: _Side, other: _Side, partner: Dict[Ident, Ident]) -> dict:
-    confirmed, aside, unconfirmed = [], [], []
+    buckets: Dict[str, list] = {"confirmed": [], "set_aside": [], "unconfirmed": [], "unpaired": []}
     for r in range(len(side.records)):
-        ins_by: Dict[Ident, List[int]] = defaultdict(list)
-        for ident, sig in side.ins[r]:
-            ins_by[ident].append(sig)
+        ins_by: Dict[Ident, List[Key]] = defaultdict(list)
+        for ident, key in side.ins[r]:
+            ins_by[ident].append(key)
         done = set()
-        for ident, out_sig in side.outs[r]:
-            if ident not in partner or (ident, out_sig) in done:
+        for ident, out_key in side.outs[r]:
+            if ident not in partner or (ident, out_key) in done:
                 continue
-            done.add((ident, out_sig))
-            P = other.sigs[partner[ident]]
+            done.add((ident, out_key))
+            pid = partner[ident]
+            P = other.sigs[pid]
             ins = ins_by.get(ident)
-            if out_sig in P or not ins:
+            if out_key in P or not ins:
                 continue
-            bad = [s for s in ins if s not in P]
+            bad = [k for k in ins if k not in P]
             if not bad:
-                kind = "operator"
-            elif all(side.producer.get((ident, s), r) >= r for s in bad):
-                kind = "uncaptured_upstream"
+                kind, bad_in = "operator", None
+            elif all(side.producer.get((ident, k), r) >= r for k in bad):
+                kind, bad_in = "uncaptured_upstream", bad[0]
             else:
                 continue                             # an earlier captured record parted first
-            status, where = _confirm(side, r, ident, out_sig, P)
-            item = {"kind": kind, **side.describe(r), "status": status,
+            item = {"kind": kind, **side.describe(r),
                     "token": {"forward": ident[0], "row": ident[1]},
-                    "other_token": {"forward": partner[ident][0], "row": partner[ident][1]}}
-            if where is not None:
-                item["agreement_returned_at"] = side.describe(where)
-            {"confirmed": confirmed, "set_aside": aside, "unconfirmed": unconfirmed}[status].append((r, item))
+                    "other_token": {"forward": pid[0], "row": pid[1]}}
+            pair = _pair(side, other, ident, pid, [k for k in ins if k in P], out_key, bad_in)
+            if pair is None:
+                item["status"] = "unpaired"
+            else:
+                item["pair"] = pair
+                item["status"], where = _confirm(side, r, ident, out_key, P)
+                if where is not None:
+                    item["agreement_returned_at"] = side.describe(where)
+            buckets[item["status"]].append((r, item))
+    confirmed = buckets["confirmed"]
     per_token, firsts = [], set()
     for r, item in confirmed:
         key = (item["token"]["forward"], item["token"]["row"])
         if key not in firsts:
             firsts.add(key)
             per_token.append(item)
-    return {"pivot": confirmed[0][1] if confirmed else None,
-            "tokens_diverged": len(firsts), "per_token": per_token[:64],
-            "set_aside": [i for _, i in aside[:10]], "set_aside_total": len(aside),
-            "unconfirmed": [i for _, i in unconfirmed[:10]], "unconfirmed_total": len(unconfirmed),
-            "forward_source": side.forward_source}
+    out = {"pivot": confirmed[0][1] if confirmed else None,
+           "tokens_diverged": len(firsts), "per_token": per_token[:64],
+           "forward_source": side.forward_source}
+    for name in ("set_aside", "unconfirmed", "unpaired"):
+        out[name] = [i for _, i in buckets[name][:10]]
+        out[f"{name}_total"] = len(buckets[name])
+    return out
 
 
 def match_tokens(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, dict]],
@@ -281,7 +341,7 @@ def match_tokens(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, di
     links = _links(L, R)
     lp = {a: b for a, b in links}
     rp = {b: a for a, b in links}
-    rep = {"method": "xor_token_dataflow_v1", "linked_tokens": len(links), "applicable": bool(links)}
+    rep = {"method": "xor_token_dataflow_v2", "linked_tokens": len(links), "applicable": bool(links)}
     if links:
         rep["left"], rep["right"] = _analyze(L, R, lp), _analyze(R, L, rp)
         rep["pivot"] = {"left": rep["left"]["pivot"], "right": rep["right"]["pivot"]}
@@ -321,8 +381,11 @@ def main(argv=None):
             s, p = rep[side], rep[side]["pivot"]
             head = (f"{p['kind']} {p['function']} {p['file']}:{p['line']} counter={p['counter']} token={p['token']}"
                     if p else "none")
+            if p and p.get("pair", {}).get("differing_vectors") is not None:
+                head += f" differing vectors={p['pair']['differing_vectors']}/{p['pair']['vectors']}"
             print(f"  pivot[{name}]: {head}  (forwards: {s['forward_source']}; tokens diverged: "
-                  f"{s['tokens_diverged']}; set aside: {s['set_aside_total']}; unconfirmed: {s['unconfirmed_total']})")
+                  f"{s['tokens_diverged']}; set aside: {s['set_aside_total']}; unpaired: {s['unpaired_total']}; "
+                  f"unconfirmed: {s['unconfirmed_total']})")
     return report
 
 

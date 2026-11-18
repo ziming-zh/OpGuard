@@ -87,14 +87,22 @@ def forward(prefix, c0, toks, ops, split_ops=(), changed=None, extra=None, tail=
 OPS = ["q_proj", "rope", "q_norm", "o_proj", "mlp"]
 
 
-def bad(i, from_op="q_norm"):
-    """Token i's rows differ from `from_op` on (whole rows changed, propagated downstream)."""
-    return {(op, i): Tok() for op in OPS[OPS.index(from_op):]}
+class Near(Tok):
+    """A token whose row at `op` keeps all heads of `orig` but one; later ops differ wholly."""
+    def __init__(self, orig, op):
+        super().__init__()
+        self.heads[op] = [orig.row(op)[0] ^ 0x10000] + orig.row(op)[1:]
+
+
+def bad(toks, i, from_op="q_norm"):
+    """Token i diverges at `from_op` in one head; downstream rows differ wholly."""
+    t = Near(toks[i], from_op)
+    return {(op, i): t for op in OPS[OPS.index(from_op):]}
 
 
 def test_prefill_head_split_vs_merged_pivots_at_q_norm():
     toks = [Tok() for _ in range(6)]
-    diff = bad(3)
+    diff = bad(toks, 3)
     left = forward("v", 100, toks, OPS)
     right = forward("o", 200, toks, OPS, split_ops=("q_proj", "rope", "q_norm"), changed=diff)
     rep = tm.match_tokens(left, right)
@@ -106,11 +114,13 @@ def test_prefill_head_split_vs_merged_pivots_at_q_norm():
 
 def test_uncaptured_operator_points_at_its_consumer():
     toks = [Tok() for _ in range(6)]
-    diff = bad(2)
-    left = forward("v", 100, toks, OPS)
-    right = [r for r in forward("o", 200, toks, OPS, changed=diff) if r[0] != "o/q_norm"]
+    diff, split = bad(toks, 2), ("q_proj", "rope", "q_norm")
+    left = forward("v", 100, toks, OPS, split_ops=split)
+    right = [r for r in forward("o", 200, toks, OPS, split_ops=split, changed=diff) if r[0] != "o/q_norm"]
     rep = tm.match_tokens(left, right)
     assert rep["pivot"]["left"]["record"] == "v/q_norm" and rep["pivot"]["left"]["kind"] == "operator"
+    assert rep["pivot"]["left"]["pair"]["by"] == "near_match"
+    assert rep["pivot"]["left"]["pair"]["differing_vectors"] == [0]     # the one differing head
     assert rep["pivot"]["right"]["record"] == "o/o_proj"
     assert rep["pivot"]["right"]["kind"] == "uncaptured_upstream"
 
@@ -119,7 +129,7 @@ def test_rollout_prefill_decode_batched_vs_trainer_prefill():
     A, B = [Tok() for _ in range(8)], [Tok() for _ in range(8)]
     rollout = forward("r/pre", 1, [B[0], A[0], B[1], A[1], B[2], A[2], B[3], A[3]], OPS)
     for s in range(4, 8):   # decode: one token of B and of A per step; A's token 5 differs
-        ch = bad(1) if s == 5 else None
+        ch = bad([B[s], A[s]], 1) if s == 5 else None
         rollout += forward(f"r/dec{s}", 10 * s, [B[s], A[s]], OPS, changed=ch)
     trainer = forward("t", 500, A, OPS)
     rep = tm.match_tokens(rollout, trainer)
@@ -149,7 +159,7 @@ def test_one_sided_middle_op_and_tail_raise_nothing():
 def test_repeated_token_ids_link_by_position_dependent_rows():
     toks = [Tok() for _ in range(6)]
     toks[4].heads["embed"] = toks[1].row("embed")          # same token id at positions 1 and 4
-    diff = bad(4)
+    diff = bad(toks, 4)
     rep = tm.match_tokens(forward("v", 100, toks, OPS), forward("o", 200, toks, OPS, changed=diff))
     assert rep["linked_tokens"] == 6
     assert rep["pivot"]["left"]["token"]["row"] == 4
@@ -199,14 +209,14 @@ def test_moe_dispatch_inside_a_marked_forward_is_not_a_new_forward():
         dispatch = (f"{p}/dispatch", rec(12, "moe_dispatch",
                                          [{"shape": [8], "stats": {"dtype": "torch.int64"}}, act(routed)], act(routed)))
         return [(f"{p}/fwd", marker(9, 4))] + recs[:2] + [dispatch] + recs[2:]
-    rep = tm.match_tokens(side("v", None), side("o", bad(1)))
+    rep = tm.match_tokens(side("v", None), side("o", bad(toks, 1)))
     assert rep["linked_tokens"] == 4
     assert rep["right"]["forward_source"] == "markers"
     assert rep["pivot"]["right"]["record"] == "o/q_norm"
     assert rep["pivot"]["right"]["token"] == {"forward": 0, "row": 1}
 
 
-def test_one_sided_cast_whose_consumer_agrees_again_is_set_aside():
+def test_one_sided_cast_is_unpaired_not_a_divergence():
     toks = [Tok() for _ in range(4)]
     def side(p, with_cast):
         R = lambda op: [t.row(op) for t in toks]
@@ -222,8 +232,8 @@ def test_one_sided_cast_whose_consumer_agrees_again_is_set_aside():
         return recs
     rep = tm.match_tokens(side("v", True), side("o", False))
     assert rep["pivot"] == {"left": None, "right": None}
-    assert rep["left"]["set_aside_total"] == 4
-    assert rep["left"]["set_aside"][0]["agreement_returned_at"]["record"] == "v/rope"
+    assert rep["left"]["unpaired_total"] == 4          # no evidence on the other side: a gap
+    assert rep["left"]["unpaired"][0]["record"] == "v/cast"
 
 
 def test_forwards_list_from_the_harness():
@@ -232,11 +242,52 @@ def test_forwards_list_from_the_harness():
         recs = forward(p, 10, toks, OPS, changed=diff)
         recs[0][1]["inputs"] = {"args": []}                           # nothing to infer a forward from
         return recs
-    left, right = side("v", None), side("o", bad(2))
+    left, right = side("v", None), side("o", bad(toks, 2))
     assert not tm.match_tokens(left, right)["applicable"]
     rep = tm.match_tokens(left, right, [{"counter": 10, "tokens": 4}], [{"counter": 10, "tokens": 4}])
     assert rep["left"]["forward_source"] == "list"
     assert rep["pivot"]["right"]["record"] == "o/q_norm"
+
+
+def test_fused_away_input_norm_with_view_consumer_raises_nothing():
+    """Real-trace failure: the trainer fuses the input norm into its QKV linear, so the
+    engine's norm output has no counterpart; its only direct consumer is a view."""
+    toks = [Tok() for _ in range(5)]
+    def side(p, fused, diff=None):
+        R = lambda op: [(diff or {}).get((op, i), t).row(op) for i, t in enumerate(toks)]
+        recs = [(f"{p}/embed", rec(1, "embed", [ids(5)], act(R("embed"))))]
+        if fused:
+            recs.append((f"{p}/norm_linear", rec(2, "rmsnorm_linear", [act(R("embed"))], act(R("q_proj")))))
+        else:
+            normed = [[sig() for _ in range(HEADS)] for _ in toks]          # never observed by the trainer
+            recs += [(f"{p}/norm", rec(2, "rms_norm", [act(R("embed"))], act(normed))),
+                     (f"{p}/view", rec(3, "view", [act(normed)], act(normed))),
+                     (f"{p}/q_proj", rec(4, "matmul", [act(normed)], act(R("q_proj"))))]
+        split = ("q_proj", "q_norm")
+        recs += [(f"{p}/q_norm", rec(5, "q_norm", [act(R("q_proj"), True)], act(R("q_norm"), True))),
+                 (f"{p}/o_proj", rec(6, "o_proj", [act(R("q_norm"), True)], act(R("o_proj"))))]
+        return recs
+    clean = tm.match_tokens(side("v", False), side("o", True))
+    assert clean["pivot"] == {"left": None, "right": None}
+    assert clean["left"]["unpaired_total"] == 5 and clean["left"]["unpaired"][0]["record"] == "v/norm"
+    t = Near(toks[2], "q_norm")
+    rep = tm.match_tokens(side("v", False), side("o", True, {("q_norm", 2): t, ("o_proj", 2): t}))
+    assert rep["pivot"]["left"]["record"] == "v/q_norm" and rep["pivot"]["right"]["record"] == "o/q_norm"
+    assert rep["pivot"]["right"]["pair"]["by"] == "same_input"
+
+
+def test_equal_fingerprints_of_different_widths_do_not_alias():
+    """Real-trace failure: a Q row (8 KB) and a K row (2 KB) had the same 32-bit value."""
+    toks = [Tok() for _ in range(4)]
+    q = [t.row("q") for t in toks]
+    k = [[sig() for _ in range(HEADS // 2)] for _ in toks]
+    k[3][0] ^= merged(k[3]) ^ merged(q[1])                    # K row 3 now XORs to Q row 1's value
+    kt = {"shape": [4, HEADS // 2, H // HEADS], "stats": {"dtype": "torch.bfloat16", "xor_rows": [h for r in k for h in r]}}
+    side = tm._Side([("embed", rec(1, "embed", [ids(4)], act([t.row("e") for t in toks]))),
+                     ("q", rec(2, "q_proj", [act([t.row("e") for t in toks])], act(q))),
+                     ("k_use", rec(3, "attn", [kt], act([t.row("a") for t in toks])))], None)
+    row3 = next(ident for ident, key in side.ins[2] if key[2] == merged(q[1]))
+    assert row3 == (0, 3)                                       # not inherited from Q's token 1
 
 
 if __name__ == "__main__":
