@@ -14,6 +14,7 @@
 extern "C" void xor_first_pass_auto_or_small(const uint8_t*,  uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
 extern "C" void xor_words_auto_or_small     (const uint32_t*, uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
 extern "C" void xor_regional_launch(const uint8_t*, uint32_t*, uint32_t*, size_t, int, int, cudaStream_t);
+extern "C" void xor_segments_launch(const uint8_t*, uint32_t*, size_t, size_t, cudaStream_t);
 
 // constants local to binding
 static constexpr int BLOCK_SIZE = 256;
@@ -177,7 +178,26 @@ at::Tensor xor_reduce_regional_cuda(at::Tensor bytes, int64_t regions) {
     return out;
 }
 
+// One XOR per fixed segment of the flat bytes (e.g. per last-dim vector); int32[nseg].
+at::Tensor xor_reduce_segments_cuda(at::Tensor bytes, int64_t seg_bytes) {
+    TORCH_CHECK(bytes.is_cuda() && bytes.scalar_type() == at::kByte && bytes.is_contiguous(),
+                "input must be contiguous CUDA uint8");
+    TORCH_CHECK(seg_bytes >= 4 && seg_bytes % 4 == 0, "seg_bytes must be a positive multiple of 4");
+    const auto dev = bytes.device();
+    c10::cuda::CUDAGuard guard(dev);
+    const auto stream = at::cuda::getCurrentCUDAStream(dev.index()).stream();
+    const size_t nbytes = bytes.numel();
+    const int64_t nseg = static_cast<int64_t>((nbytes + seg_bytes - 1) / seg_bytes);
+    auto out = at::empty({nseg}, bytes.options().dtype(at::kInt));
+    if (nseg > 0)
+        xor_segments_launch(bytes.data_ptr<uint8_t>(), reinterpret_cast<uint32_t*>(out.data_ptr<int32_t>()),
+                            nbytes, static_cast<size_t>(seg_bytes), stream);
+    return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("xor_reduce_segments_cuda", &xor_reduce_segments_cuda,
+          "One XOR per fixed byte segment on current stream (no host synchronization)");
     m.def("xor_reduce_regional_cuda", &xor_reduce_regional_cuda,
           "Fixed flat-word regional XOR on current stream (no host synchronization)");
     m.def("xor_reduce_cuda",       &xor_reduce_cuda,       "XOR reduce (bytes, cached workspace) on current stream");

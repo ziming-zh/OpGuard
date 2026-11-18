@@ -263,6 +263,60 @@ extern "C" void xor_regional_launch(const uint8_t* bytes, uint32_t* partial,
         xor_regional_finish<<<regions, BLOCK_SIZE, 0, stream>>>(partial, out, blocks);
 }
 
+// ======================= Segmented XOR (one fingerprint per fixed segment) =======================
+// Segment s covers bytes [s*seg_bytes, (s+1)*seg_bytes) of the flat buffer (seg_bytes % 4 == 0),
+// zero-padded at the end, so segment fingerprints XOR-merge into any aligned coarser range.
+// Used with seg_bytes = last-dim bytes: one fingerprint per row vector. One launch, no partials:
+// a warp per segment for small segments, a block per segment for large ones; reads are coalesced.
+template<bool Aligned>
+__global__ void xor_segments_warp(const uint8_t* bytes, uint32_t* out, size_t nbytes,
+                                  size_t wps, size_t nseg) {
+    const size_t seg = (size_t)blockIdx.x * WARPS_PER_BLOCK + (threadIdx.x >> 5);
+    if (seg >= nseg) return;                       // whole warp leaves together
+    const int lane = threadIdx.x & 31;
+    const size_t words = (nbytes + 3) / 4, begin = seg * wps;
+    const size_t end = begin + wps < words ? begin + wps : words;
+    uint32_t acc = 0;
+    for (size_t w = begin + lane; w < end; w += 32)
+        acc ^= regional_word<Aligned>(bytes, nbytes, w);
+    acc = warp_xor(acc);
+    if (lane == 0) out[seg] = acc;
+}
+
+template<bool Aligned>
+__global__ void xor_segments_block(const uint8_t* bytes, uint32_t* out, size_t nbytes, size_t wps) {
+    const size_t seg = blockIdx.x;
+    const size_t words = (nbytes + 3) / 4, begin = seg * wps;
+    const size_t end = begin + wps < words ? begin + wps : words;
+    uint32_t acc = 0;
+    for (size_t w = begin + threadIdx.x; w < end; w += blockDim.x)
+        acc ^= regional_word<Aligned>(bytes, nbytes, w);
+    acc = warp_xor(acc);
+    __shared__ uint32_t warps[WARPS_PER_BLOCK];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) warps[wid] = acc;
+    __syncthreads();
+    if (wid == 0) {
+        acc = warp_xor(lane < WARPS_PER_BLOCK ? warps[lane] : 0u);
+        if (lane == 0) out[seg] = acc;
+    }
+}
+
+extern "C" void xor_segments_launch(const uint8_t* bytes, uint32_t* out, size_t nbytes,
+                                    size_t seg_bytes, cudaStream_t stream) {
+    const size_t wps = seg_bytes / 4, nseg = (nbytes + seg_bytes - 1) / seg_bytes;
+    if (nseg == 0) return;
+    const bool aligned = reinterpret_cast<uintptr_t>(bytes) % 4 == 0 && nbytes % 4 == 0;
+    if (wps < 512) {                               // segments under 2 KB: a warp each
+        const unsigned grid = (unsigned)((nseg + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK);
+        if (aligned) xor_segments_warp<true><<<grid, BLOCK_SIZE, 0, stream>>>(bytes, out, nbytes, wps, nseg);
+        else xor_segments_warp<false><<<grid, BLOCK_SIZE, 0, stream>>>(bytes, out, nbytes, wps, nseg);
+    } else {                                       // larger segments: a block each
+        if (aligned) xor_segments_block<true><<<(unsigned)nseg, BLOCK_SIZE, 0, stream>>>(bytes, out, nbytes, wps);
+        else xor_segments_block<false><<<(unsigned)nseg, BLOCK_SIZE, 0, stream>>>(bytes, out, nbytes, wps);
+    }
+}
+
 // ======================= C-linkage launchers (bind to provided stream) =======================
 
 extern "C"

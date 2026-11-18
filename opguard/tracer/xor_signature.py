@@ -120,7 +120,7 @@ def _flat_word_signature(tensor: torch.Tensor, regions: int) -> torch.Tensor:
     return acc[:, 0].to(torch.uint32)
 
 
-def xor_chunk_signature(tensor: torch.Tensor, chunk_bytes: int) -> torch.Tensor:
+def xor_chunk_signature(tensor: torch.Tensor, chunk_bytes: int, native: bool = True) -> torch.Tensor:
     """XOR of each fixed-size chunk of the tensor's flat little-endian bytes.
 
     Returns int32[ceil(nbytes / chunk_bytes)] on the tensor's device (read as
@@ -135,6 +135,14 @@ def xor_chunk_signature(tensor: torch.Tensor, chunk_bytes: int) -> torch.Tensor:
     nbytes = raw.numel()
     if nbytes == 0:
         return torch.zeros(0, dtype=torch.int32, device=raw.device)
+    if native and raw.is_cuda and _xor_reduce_cuda_ext is not None \
+            and hasattr(_xor_reduce_cuda_ext, "xor_reduce_segments_cuda"):
+        raw.record_stream(torch.cuda.current_stream(raw.device))
+        return _xor_reduce_cuda_ext.xor_reduce_segments_cuda(raw, chunk_bytes)
+    # Fallback (no native segmented kernel): ~log2(words per chunk) passes and
+    # temporary memory about the size of the tensor.
+    if raw.storage_offset() % 4:
+        raw = raw.clone()                 # int32 view needs a 4-byte aligned start
     pad = (-nbytes) % chunk_bytes
     if pad:
         raw = torch.cat((raw, torch.zeros(pad, dtype=torch.uint8, device=raw.device)))
