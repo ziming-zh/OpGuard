@@ -19,6 +19,7 @@ procedures. They are not a mandatory three-stage pipeline or separate agents.
 | [investigate-first-diff](../skills/investigate-first-diff/SKILL.md) | Run comparability, initial difference boundary, routing and evidence synthesis | Root-cause explanation or a clearly bounded inconclusive result |
 | [trace-upstream](../skills/trace-upstream/SKILL.md) | Following evidenced producers, mutations and dependencies backward | Narrowed causal boundary, candidate mechanism or missing observation |
 | [validate-hypothesis](../skills/validate-hypothesis/SKILL.md) | A discriminating test of one explicit candidate cause | Supported / refuted / inconclusive, with control and evidence |
+| [rl-alignment](../skills/rl-alignment/SKILL.md) | RL rollout/trainer parity: weight-sync check, staleness vs numeric split, offline localization and cause class (protocol draft: [RLAlignment.md](../../docs/RLAlignment.md)) | Split, localized operator and token on each side, or bounded inconclusive |
 
 Start by asking your coding agent to read
 `harness/skills/investigate-first-diff/SKILL.md` from the repository root and investigate two identified captures.

@@ -113,6 +113,9 @@ I/O budgets are not part of protocol v1.
 
 ### Diagnostic fingerprints
 
+Opt-in per-vector fingerprints for cross-stack and RL alignment, and the draft
+`vectors.*` / `rl.*` actions, are specified in [RLAlignment.md](RLAlignment.md).
+
 New captures default to four `uint32` XOR fingerprints per tensor (16 bytes).
 `OPGUARD_XOR_REGIONAL` selects 1–64 regions; unset means 4, and 0 is a legacy
 alias for 1. This setting affects diagnostic summaries, not explicit low-level
