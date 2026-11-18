@@ -5,27 +5,31 @@ carries ``stats.xor_rows``, one XOR per vector of its last dimension. Capture
 assumes nothing about what a tensor means.
 
 At compare time:
-1. Each side's trace is cut into forwards. A forward starts at an explicit
-   ``<opguard.forward>`` marker record (``tokens``: T), or at a record that
-   turns an integer tensor of N elements into a float tensor whose leading
-   dimensions multiply to N while no float input has that leading size (an
-   embedding). That N is the forward's token count T. Records before the first
-   forward (weight loading, setup) are not compared.
+1. Each side's trace is cut into forwards at the boundaries the OpGuard harness
+   gives: ``<opguard.forward>`` marker records (``tokens``: T) in the trace, or a
+   list of {"counter", "tokens"} passed in (``--run1-forwards`` / ``--run2-forwards``).
+   Only when it gives none, a forward starts at a record that turns an integer
+   tensor of N elements into a float tensor whose leading dims multiply to N.
+   Records before the first forward (weight loading, setup) are not compared.
 2. In a forward, a tensor whose leading dimensions multiply to T has one row
    per token. Its vector XORs merge (XOR is order-free) into one fingerprint per
-   token, so ``[T, heads, dim]`` and ``[T, hidden]`` give the same row.
+   token, so ``[T, heads, dim]`` and ``[T, hidden]`` give the same row. Tensors
+   of another leading size (e.g. MoE dispatch, T*topk rows) are skipped.
 3. Within a side a token keeps its identity through a forward: an output row
    inherits the identity of the same row of the record's token-shaped input,
    and an input row is recognised by the fingerprint of the earlier row it is.
+   Equal fingerprints also give the data dependencies: a record whose input row
+   equals an earlier output row consumed that row.
 4. Tokens are linked across sides by row fingerprints that belong to one token
    on each side; a link is kept only when each token is the other's best match.
-   Order, batching, prefill/decode and call sites play no part.
-5. Each linked token has a chain: its output rows in trace order, each found or
-   not among the other side's rows of the same token. It breaks after its last
-   found row only if both sides go on computing it (one-sided extra ops or a
-   one-sided tail are not breaks). The pivot is the earliest break. If the
-   breaking record's own input row already disagrees, the divergence is in
-   uncaptured code just before it.
+5. Data flow, not trace order (a token's work branches: Q, K, V, residual). A
+   record is a candidate for a linked token when its input rows of that token
+   agree with the other side and its output row does not ("operator"), or when
+   a disagreeing input row has no captured producer ("uncaptured_upstream").
+   It is confirmed when the rows that consume its output downstream also
+   disagree, set aside (and listed) when they agree again, and listed as
+   unconfirmed when nothing captured consumes it. The pivot is the earliest
+   confirmed candidate; each token's earliest is listed too.
 
 Exact fingerprint equality only; an unlinked token or unmatched row is a gap.
 """
@@ -40,6 +44,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .value_match import _tensors, load_dir
 
 Ident = Tuple[int, int]          # (forward id, row index at the forward's start)
+MARKER = "<opguard.forward>"
+CONFIRM_HOPS = 4                 # how far downstream a candidate is followed
 
 
 def _shape(t: dict) -> Optional[List[int]]:
@@ -97,7 +103,7 @@ def _token_rows(t: dict, T: int) -> Optional[List[int]]:
 
 
 def _forward_start(rec: dict) -> Optional[int]:
-    if rec.get("function") == "<opguard.forward>" and isinstance(rec.get("tokens"), int):
+    if rec.get("function") == MARKER and isinstance(rec.get("tokens"), int):
         return rec["tokens"]
     ins = list(_tensors(rec.get("inputs")))
     outs = list(_tensors(rec.get("outputs")))
@@ -116,18 +122,29 @@ def _forward_start(rec: dict) -> Optional[int]:
 
 
 class _Side:
-    def __init__(self, records: Sequence[Tuple[Any, dict]]):
+    def __init__(self, records: Sequence[Tuple[Any, dict]], forwards: Optional[List[dict]] = None):
         self.ids = [rid for rid, _ in records]
         self.records = [rec for _, rec in records]
         # per record: list of (identity, sig) for inputs and outputs
         self.ins: List[List[Tuple[Ident, int]]] = [[] for _ in self.records]
         self.outs: List[List[Tuple[Ident, int]]] = [[] for _ in self.records]
-        f, T, seen = -1, None, {}
+        markers = any(rec.get("function") == MARKER for rec in self.records)
+        plan = sorted(forwards or [], key=lambda x: x["counter"])
+        self.forward_source = "list" if plan else "markers" if markers else "inferred"
+        f, T, seen, k = -1, None, {}, 0
         for r, rec in enumerate(self.records):
-            n = _forward_start(rec)
+            n = None
+            if plan:
+                c = rec.get("counter")
+                while isinstance(c, int) and k < len(plan) and c >= plan[k]["counter"]:
+                    n, k = plan[k]["tokens"], k + 1
+            elif markers:
+                n = rec.get("tokens") if rec.get("function") == MARKER else None
+            else:
+                n = _forward_start(rec)
             if n is not None:
                 f, T, seen = f + 1, n, {}
-            if T is None:
+            if T is None or rec.get("function") == MARKER:
                 continue
             in_ids: Optional[List[Ident]] = None
             for t in _tensors(rec.get("inputs")):
@@ -154,13 +171,17 @@ class _Side:
                         seen[sig] = ident if seen.get(sig, ident) == ident else "ambiguous"
         self.sigs: Dict[Ident, set] = defaultdict(set)
         self.owners: Dict[int, set] = defaultdict(set)
+        self.producer: Dict[Tuple[Ident, int], int] = {}
+        self.consumers: Dict[Tuple[Ident, int], List[int]] = defaultdict(list)
+        for r in range(len(self.records)):
+            for ident, sig in self.ins[r]:
+                self.consumers[(ident, sig)].append(r)
+            for ident, sig in self.outs[r]:
+                self.producer.setdefault((ident, sig), r)
         for obs in self.ins + self.outs:
             for ident, sig in obs:
                 self.sigs[ident].add(sig)
                 self.owners[sig].add(ident)
-
-    def chain(self, ident: Ident) -> List[Tuple[int, int]]:
-        return [(r, sig) for r, obs in enumerate(self.outs) for i, sig in obs if i == ident]
 
     def describe(self, r: Optional[int]) -> Optional[dict]:
         if r is None:
@@ -186,63 +207,109 @@ def _links(L: _Side, R: _Side) -> List[Tuple[Ident, Ident]]:
     return sorted((a, b) for a, (n, b) in best_l.items() if best_r.get(b, (0, None))[1] == a)
 
 
-def _break(side: _Side, ident: Ident, other: set) -> Tuple[Optional[int], Optional[int]]:
-    """(last agreeing record, first record of the disagreeing tail) of a chain."""
-    ch = side.chain(ident)
-    last = max((k for k, (_, sig) in enumerate(ch) if sig in other), default=None)
-    if last is None:
-        return None, None
-    tail = ch[last + 1:]
-    return ch[last][0], (tail[0][0] if tail else None)
+def _confirm(side: _Side, r: int, ident: Ident, out_sig: int, P: set):
+    """Follow the token's row downstream along data dependencies on this side."""
+    frontier, seen, consumed = [(r, out_sig)], {out_sig}, False
+    for _ in range(CONFIRM_HOPS):
+        nxt = []
+        for r0, sig in frontier:
+            for r2 in side.consumers.get((ident, sig), []):
+                if r2 <= r0:
+                    continue
+                consumed = True
+                for i2, o2 in side.outs[r2]:
+                    if i2 != ident:
+                        continue
+                    if o2 in P:
+                        return "set_aside", r2      # agreement returned: one-sided op
+                    if o2 not in seen:
+                        seen.add(o2)
+                        nxt.append((r2, o2))
+        frontier = nxt
+        if not frontier:
+            break
+    return ("confirmed" if consumed else "unconfirmed"), None
 
 
-def match_tokens(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, dict]]) -> dict:
-    """Token-chain alignment of two ordered record lists of one rank."""
-    L, R = _Side(left), _Side(right)
+def _analyze(side: _Side, other: _Side, partner: Dict[Ident, Ident]) -> dict:
+    confirmed, aside, unconfirmed = [], [], []
+    for r in range(len(side.records)):
+        ins_by: Dict[Ident, List[int]] = defaultdict(list)
+        for ident, sig in side.ins[r]:
+            ins_by[ident].append(sig)
+        done = set()
+        for ident, out_sig in side.outs[r]:
+            if ident not in partner or (ident, out_sig) in done:
+                continue
+            done.add((ident, out_sig))
+            P = other.sigs[partner[ident]]
+            ins = ins_by.get(ident)
+            if out_sig in P or not ins:
+                continue
+            bad = [s for s in ins if s not in P]
+            if not bad:
+                kind = "operator"
+            elif all(side.producer.get((ident, s), r) >= r for s in bad):
+                kind = "uncaptured_upstream"
+            else:
+                continue                             # an earlier captured record parted first
+            status, where = _confirm(side, r, ident, out_sig, P)
+            item = {"kind": kind, **side.describe(r), "status": status,
+                    "token": {"forward": ident[0], "row": ident[1]},
+                    "other_token": {"forward": partner[ident][0], "row": partner[ident][1]}}
+            if where is not None:
+                item["agreement_returned_at"] = side.describe(where)
+            {"confirmed": confirmed, "set_aside": aside, "unconfirmed": unconfirmed}[status].append((r, item))
+    per_token, firsts = [], set()
+    for r, item in confirmed:
+        key = (item["token"]["forward"], item["token"]["row"])
+        if key not in firsts:
+            firsts.add(key)
+            per_token.append(item)
+    return {"pivot": confirmed[0][1] if confirmed else None,
+            "tokens_diverged": len(firsts), "per_token": per_token[:64],
+            "set_aside": [i for _, i in aside[:10]], "set_aside_total": len(aside),
+            "unconfirmed": [i for _, i in unconfirmed[:10]], "unconfirmed_total": len(unconfirmed),
+            "forward_source": side.forward_source}
+
+
+def match_tokens(left: Sequence[Tuple[Any, dict]], right: Sequence[Tuple[Any, dict]],
+                 left_forwards: Optional[List[dict]] = None,
+                 right_forwards: Optional[List[dict]] = None) -> dict:
+    """Token alignment of two ordered record lists of one rank, with a data-flow pivot."""
+    L, R = _Side(left, left_forwards), _Side(right, right_forwards)
     links = _links(L, R)
-    breaks = []
-    for a, b in links:
-        l_last, l_brk = _break(L, a, R.sigs[b])
-        r_last, r_brk = _break(R, b, L.sigs[a])
-        if l_brk is None or r_brk is None:
-            continue                 # agrees to the end, or only one side goes on
-        breaks.append({"left_token": list(a), "right_token": list(b),
-                       "left": l_brk, "right": r_brk, "left_last": l_last, "right_last": r_last})
+    lp = {a: b for a, b in links}
+    rp = {b: a for a, b in links}
+    rep = {"method": "xor_token_dataflow_v1", "linked_tokens": len(links), "applicable": bool(links)}
+    if links:
+        rep["left"], rep["right"] = _analyze(L, R, lp), _analyze(R, L, rp)
+        rep["pivot"] = {"left": rep["left"]["pivot"], "right": rep["right"]["pivot"]}
+    else:
+        rep["pivot"] = None
+    return rep
 
-    def kind(side: _Side, r: int, ident: Ident, other: set) -> str:
-        own = [sig for i, sig in side.ins[r] if i == ident]
-        return "operator" if own and all(s in other for s in own) else "uncaptured_upstream"
 
-    def pivot(which: str, side: _Side, other_side: _Side):
-        if not breaks:
-            return None
-        b = min(breaks, key=lambda x: (x[which], x["left"] + x["right"]))
-        ident = tuple(b[f"{which}_token"])
-        other_ident = tuple(b["right_token" if which == "left" else "left_token"])
-        o = "right" if which == "left" else "left"
-        return {"kind": kind(side, b[which], ident, other_side.sigs[other_ident]),
-                **side.describe(b[which]),
-                "token": {"forward": ident[0], "row": ident[1]},
-                "last_agreeing": side.describe(b[f"{which}_last"]),
-                "other_side": {"token": {"forward": other_ident[0], "row": other_ident[1]},
-                               "break": other_side.describe(b[o]),
-                               "last_agreeing": other_side.describe(b[f"{o}_last"])},
-                "tokens_broken": len(breaks)}
-
-    return {"method": "xor_token_chain_v1", "linked_tokens": len(links),
-            "applicable": bool(links),
-            "pivot": {"left": pivot("left", L, R), "right": pivot("right", R, L)} if links else None}
+def _forwards(path: Optional[str], rank: int) -> Optional[List[dict]]:
+    if not path:
+        return None
+    data = json.loads(Path(path).read_text())
+    return data.get(str(rank), []) if isinstance(data, dict) else data
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Cross-stack token-chain alignment (prototype)")
+    ap = argparse.ArgumentParser(description="Cross-stack token alignment with a data-flow pivot (prototype)")
     ap.add_argument("run1"); ap.add_argument("run2")
     ap.add_argument("--rank", type=int, action="append")
+    ap.add_argument("--run1-forwards", help='JSON list of {"counter", "tokens"} (or {rank: list}) from the harness')
+    ap.add_argument("--run2-forwards", help="same, for run2")
     ap.add_argument("--out")
     args = ap.parse_args(argv)
     a, b = load_dir(args.run1), load_dir(args.run2)
     ranks = sorted(set(a) & set(b)) if not args.rank else args.rank
-    report = {str(r): match_tokens(a.get(r, []), b.get(r, [])) for r in ranks}
+    report = {str(r): match_tokens(a.get(r, []), b.get(r, []),
+                                   _forwards(args.run1_forwards, r), _forwards(args.run2_forwards, r))
+              for r in ranks}
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1))
     for r, rep in report.items():
@@ -250,14 +317,12 @@ def main(argv=None):
         if not rep["applicable"]:
             print("  no token linked: no row fingerprints, no forward found, or runs not bitwise-aligned")
             continue
-        for side in ("left", "right"):
-            p = rep["pivot"][side]
-            if p:
-                print(f"  pivot[{'run1' if side == 'left' else 'run2'}]: {p['kind']} {p['function']} "
-                      f"{p['file']}:{p['line']} counter={p['counter']} token={p['token']} "
-                      f"(tokens broken: {p['tokens_broken']})")
-            else:
-                print(f"  pivot[{'run1' if side == 'left' else 'run2'}]: none")
+        for side, name in (("left", "run1"), ("right", "run2")):
+            s, p = rep[side], rep[side]["pivot"]
+            head = (f"{p['kind']} {p['function']} {p['file']}:{p['line']} counter={p['counter']} token={p['token']}"
+                    if p else "none")
+            print(f"  pivot[{name}]: {head}  (forwards: {s['forward_source']}; tokens diverged: "
+                  f"{s['tokens_diverged']}; set aside: {s['set_aside_total']}; unconfirmed: {s['unconfirmed_total']})")
     return report
 
 
