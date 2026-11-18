@@ -4,7 +4,7 @@ from collections import defaultdict
 import threading
 import numpy as np
 from opguard.tracer.xor_signature import xor_signature, xor_chunk_signature, flat_word_layout
-from opguard.common_vars import ENABLE_CHECKSUM_NONCONTIG, OPGUARD_XOR_REGIONAL, OPGUARD_XOR_CHUNK_BYTES
+from opguard.common_vars import ENABLE_CHECKSUM_NONCONTIG, OPGUARD_XOR_REGIONAL, OPGUARD_XOR_ROWS
 from opguard.utils.utils import placeholder_sig_from_meta
 
 def _safe_flatten(t: torch.Tensor) -> torch.Tensor:
@@ -89,10 +89,13 @@ def summarize_tensor(t: torch.Tensor, verbosity="low", ignore_cpu=True) -> dict:
         base["stats"]["xor_signature"] = xor_signature(t, regional=regions, by="words")
         base["stats"]["xor_sig_mode"] = "bytes"
         base["stats"]["xor_sig_layout"] = flat_word_layout(t.numel() * t.element_size(), regions)
-        # Opt-in, for cross-stack alignment: one fingerprint per fixed-size chunk.
-        if OPGUARD_XOR_CHUNK_BYTES and t.numel() * t.element_size() >= OPGUARD_XOR_CHUNK_BYTES:
-            base["stats"]["xor_chunks"] = xor_chunk_signature(t, OPGUARD_XOR_CHUNK_BYTES)
-            base["stats"]["xor_chunk_bytes"] = OPGUARD_XOR_CHUNK_BYTES
+        # Opt-in, for cross-stack alignment: one fingerprint per last-dim vector.
+        # No meaning is assumed here; token dims are found at compare time.
+        if OPGUARD_XOR_ROWS and t.dim() >= 1 and t.numel():
+            row_bytes = t.shape[-1] * t.element_size()
+            if row_bytes and row_bytes % 4 == 0:
+                base["stats"]["xor_rows"] = xor_chunk_signature(t, row_bytes)
+                base["stats"]["xor_row_bytes"] = row_bytes
     except RuntimeError as e:
         # e.g., “Cannot copy out of meta tensor” if something upstream passed Fake/Meta
         base["stats"]["xor_signature"] = placeholder_sig_from_meta(t)

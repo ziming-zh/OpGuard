@@ -1,4 +1,4 @@
-"""Chunk fingerprints: merge to the whole-tensor XOR, and localize a single flip."""
+"""Vector fingerprints (xor_chunk_signature with chunk = last-dim bytes)."""
 import pytest
 import torch
 
@@ -46,3 +46,12 @@ def test_rows_survive_concat_and_batching(device):
     packed = torch.cat([a, b])
     ca, cb, cp = (set(u32(xor_chunk_signature(t, 256))) for t in (a, b, packed))
     assert ca | cb == cp
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_head_vectors_merge_to_token_rows(device):
+    q = torch.randn(38, 4096, dtype=torch.bfloat16, device=device)
+    split = q.view(38, 32, 128)
+    rows = u32(xor_chunk_signature(q, 4096 * 2))
+    heads = u32(xor_chunk_signature(split, 128 * 2))
+    assert [merge(heads[t * 32:(t + 1) * 32]) for t in range(38)] == rows

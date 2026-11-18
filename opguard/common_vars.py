@@ -24,10 +24,9 @@ OPGUARD_MULTI_OPS_PER_LINE = int(os.getenv("OPGUARD_MULTI_OPS_PER_LINE", 0))
 OPGUARD_XOR_REGIONAL = int(os.getenv("OPGUARD_XOR_REGIONAL", "4"))
 if not 0 <= OPGUARD_XOR_REGIONAL <= 64:
     raise ValueError("OPGUARD_XOR_REGIONAL must be between 0 and 64")
-# Opt-in chunk fingerprints for cross-stack alignment (0 = off; e.g. 256).
-OPGUARD_XOR_CHUNK_BYTES = int(os.getenv("OPGUARD_XOR_CHUNK_BYTES", "0"))
-if OPGUARD_XOR_CHUNK_BYTES and (OPGUARD_XOR_CHUNK_BYTES < 4 or OPGUARD_XOR_CHUNK_BYTES % 4):
-    raise ValueError("OPGUARD_XOR_CHUNK_BYTES must be 0 or a positive multiple of 4")
+# Opt-in: one XOR per last-dimension vector, for cross-stack (e.g. rollout vs
+# trainer) token alignment. 0 = off.
+OPGUARD_XOR_ROWS = int(os.getenv("OPGUARD_XOR_ROWS", "0"))
 OPGUARD_XOR_REGIONAL_THRESHOLD = int(os.getenv("OPGUARD_XOR_REGIONAL_THRESHOLD", "0"))
 
 OPGUARD_SAVE_ORI_TRACE = int(os.getenv("OPGUARD_SAVE_ORI_TRACE", 0))
