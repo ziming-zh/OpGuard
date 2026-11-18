@@ -120,6 +120,33 @@ def _flat_word_signature(tensor: torch.Tensor, regions: int) -> torch.Tensor:
     return acc[:, 0].to(torch.uint32)
 
 
+def xor_chunk_signature(tensor: torch.Tensor, chunk_bytes: int) -> torch.Tensor:
+    """XOR of each fixed-size chunk of the tensor's flat little-endian bytes.
+
+    Returns int32[ceil(nbytes / chunk_bytes)] on the tensor's device (read as
+    uint32 on the host). Chunks are byte ranges [k*chunk_bytes, (k+1)*chunk_bytes)
+    of the flat buffer, zero-padded at the end, independent of shape, so XOR-
+    merging aligned chunks gives the fingerprint of their union (e.g. a row, a
+    flat-u32 region, or the whole tensor). Runs on the current stream; no sync.
+    """
+    if type(chunk_bytes) is not int or chunk_bytes < 4 or chunk_bytes % 4:
+        raise ValueError("chunk_bytes must be a positive multiple of 4")
+    raw = tensor.detach().resolve_conj().resolve_neg().contiguous().reshape(-1).view(torch.uint8)
+    nbytes = raw.numel()
+    if nbytes == 0:
+        return torch.zeros(0, dtype=torch.int32, device=raw.device)
+    pad = (-nbytes) % chunk_bytes
+    if pad:
+        raw = torch.cat((raw, torch.zeros(pad, dtype=torch.uint8, device=raw.device)))
+    # int32 XOR is supported on CUDA; the bits are the little-endian u32 words.
+    acc = raw.view(torch.int32).reshape(-1, chunk_bytes // 4)
+    while acc.shape[1] > 1:
+        if acc.shape[1] % 2:
+            acc = torch.cat((acc, torch.zeros((acc.shape[0], 1), dtype=acc.dtype, device=acc.device)), dim=1)
+        acc = torch.bitwise_xor(acc[:, 0::2], acc[:, 1::2])
+    return acc[:, 0]
+
+
 def xor_signature(
     tensor: torch.Tensor,
     regional: int | None = None,
