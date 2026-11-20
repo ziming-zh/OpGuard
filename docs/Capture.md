@@ -93,3 +93,16 @@ captured input summaries are not proof of tensor equality. An observed first dif
 after unresolved events may not be the earliest actual divergence. Investigate
 caller/callee, upstream writes and downstream consumers to establish context, or
 retain the ambiguity. Alignment links do not establish data dependencies.
+
+## Per-vector fingerprints
+
+`OPGUARD_XOR_ROWS=1` adds one XOR per last-dimension vector to every captured
+tensor, as `stats.xor_vectors` (`scheme: lastdim-u32le-v1`, `vector_bytes`,
+`count`, and `data`: base64 of `count` little-endian uint32 values). XOR of
+consecutive vectors equals the `flat-u32-le-v1` fingerprint of their bytes, so
+vectors merge into token rows, regions or the whole tensor. Tensors whose vector
+width is not a multiple of 4 bytes, empty, non-contiguous (by default) or meta
+tensors get `xor_vectors_skipped` with the reason instead. It costs 4 bytes per
+vector and is meant for offline debugging captures; with it off, capture output is
+unchanged. Older captures wrote `xor_rows` (signed decimals); readers accept both.
+See [RLAlignment.md](RLAlignment.md).

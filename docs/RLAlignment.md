@@ -1,10 +1,10 @@
-# RL alignment protocol (draft v1)
+# RL alignment protocol (v1)
 
-Status: **design draft**. Per-vector capture exists today as `stats.xor_rows`
-(`OPGUARD_XOR_ROWS=1`, native segmented kernel). The `xor_vectors` encoding, the
-harness records and the `vectors.*` / `rl.*` actions below are specified here
-and not yet implemented. The agent workflow that uses them is
-[harness/skills/rl-alignment/SKILL.md](../harness/skills/rl-alignment/SKILL.md).
+Status: **implemented**. Capture writes `xor_vectors` (`OPGUARD_XOR_ROWS=1`, native
+segmented kernel); the harness records are written and read by
+`opguard_harness.rl_records`; the `vectors.*` / `rl.*` actions are harness tools.
+Not yet validated inside a real RL training loop. The agent workflow that uses
+them is [harness/skills/rl-alignment/SKILL.md](../harness/skills/rl-alignment/SKILL.md).
 
 ## Division of work
 
@@ -64,9 +64,18 @@ Each captured tensor may carry, beside the default regional fingerprint:
 A vector is addressed as `event_ref` + slot (`["inputs", i]` / `["outputs", j]`,
 flattened as in alignment maps) + vector index `k`.
 
-Migration from today's `xor_rows`: values are written as signed int32 decimals,
-and a single-vector tensor is written as a float scalar. Readers must mask with
-`& 0xFFFFFFFF` and accept a scalar until v1 lands.
+Captures taken before v1 carry `xor_rows` (signed int32 decimals, a float scalar
+for a single vector, width in `xor_row_bytes`). Every reader (the harness actions,
+`token_match`) accepts both and masks legacy values with `& 0xFFFFFFFF`.
+
+Capture details: a 0-dim tensor is one vector of one element. A non-contiguous
+tensor gets `xor_vectors_skipped: non_contiguous` when non-contiguous fingerprints
+are off (the default), as its regional fingerprint is skipped too. The values are
+computed on the operator's stream and stay a device tensor in the summary; the
+base64 text is made in the background writer, where summaries were already read
+back, so no host read or synchronization is added. With the option off, capture
+output is byte-identical to earlier releases. The Perfetto export carries
+`xor_vectors` / `xor_vectors_skipped` (and legacy `xor_rows`) in each io slot.
 
 ## Harness records (observed facts)
 
@@ -84,19 +93,81 @@ Recorded by harness hooks at known code points, never inferred by the backend.
 version (weights updated mid-generation with the KV cache kept) is mixed and is
 never split as if it had one version.
 
+### File format and writer
+
+One JSONL file per process (per rank), each line one record with
+`"schema": "opguard.rl.v1"` and `"type"`. Sequences are `{seq_id, token_ids,
+positions, policy_version, logprob, prompt_ids}` in `rollout_batch` (`prompt_ids`,
+optional: the context tokens before `token_ids`, so a replay can rebuild the
+sequence) and `{seq_id, positions, logprob}` in `trainer_logprob`; tokens pair
+across records by `(seq_id, position)`. Optional observed fields: `forward.rows`,
+the `[seq_id, position]` each of the T rows holds, in row order, `null` for a padding row (the engine's row
+layout, unambiguous under chunked prefill or speculative rows); and
+`rollout_batch.weights_fingerprint`, `{"scheme": "xor-of-rows-v1", "value",
+"rows"}`, the XOR of every row fingerprint of the weights the engine held when the
+batch started (`weights_fingerprint(params)`). XOR merges, so any packing of the
+same weight bytes gives the same value.
+`composition` is a list of co-batched `seq_id` lists (or null when not recorded).
+`weight_sync` holds `trainer` and `rollout` lists of `{name, shape, dtype,
+xor_vectors}`; `snapshot` holds `version` and `location`.
+
+**Log-probabilities keep their bits:** `{"dtype": "float32" | "float64",
+"encoding": "base64-le", "count", "data"}` (little-endian IEEE values). float16 and
+bfloat16 are widened to float32, which is exact, with `source_dtype` kept. A plain
+JSON list of numbers is accepted as float64 values.
+
+```python
+from opguard_harness.rl_records import RecordWriter, param_entries, weights_fingerprint
+with RecordWriter("/runs/rl/records-rank0.jsonl") as rec:      # append, flush per record, thread-safe
+    rec.forward(counter=c, rank=r, tokens=T, token_ranks=None, rows=None)   # rows: [[seq_id, position], ...]
+    rec.rollout_batch(batch_id, sequences, composition=None, engine_flags=None,
+                      weights_fingerprint=weights_fingerprint(engine_entries))  # logprob: tensor, array or list
+    rec.trainer_logprob(batch_id, policy_version, sequences, engine_flags=None)
+    rec.weight_sync(version, trainer=dict(model.named_parameters()), rollout=rollout_entries)
+    rec.snapshot(version, "/ckpt/step-1200")
+```
+
+`param_entries(named_tensors)` builds one side's `weight_sync` list in the process
+that holds the tensors (OpGuard's native kernel when importable, else torch and
+numpy), so the rollout side can send its list to the writer. `read_records(paths)`
+and `validate_record(rec)` read and check records; `python -m
+opguard_harness.rl_records FILE...` validates files. The module needs only the
+standard library, plus torch/numpy when given tensors.
+
 ## Backend actions (facts only)
 
-All follow the protocol v1 envelope in [AgentTools.md](AgentTools.md).
+They are harness tools (`opguard-harness call NAME`, or
+`opguard_harness.tools.dispatch`), read-only, needing no GPU. Function-calling
+names use underscores (`vectors_describe`, `rl_decompose`, ...); the dotted names
+below are accepted as aliases. `vectors.*` read a Perfetto export (`artifact`);
+`rl.*` read record files (`records`: a list of paths). Every result has
+`verdict: not_evaluated`.
 
 | Action | Input | Returns |
 |---|---|---|
-| `vectors.describe` | an event | per slot: shape, dtype, `vector_bytes`, `count`, optionally the first N fingerprints |
-| `vectors.lookup` | a fingerprint, or a slot + vector index; a scope (side, ranks, counter range) | every exact occurrence: run, rank, event, slot, vector index |
-| `vectors.coverage` | a slot | for each vector, whether and where it occurs on the other side |
-| `vectors.compare` | two slots plus token dims declared by the agent for each | per token row: equal, or the indices of the differing vectors |
-| `rl.decompose` | `rollout_batch`, the `trainer_logprob` records available | per token: `numeric` and `staleness` where computable, exact-zero flags, `mixed_version` flags, and which records each value came from |
-| `rl.weight_sync_check` | a `weight_sync` record | per parameter: rows equal, or the differing row indices; rows matched by fingerprint so repacking is not a difference |
-| `rl.replay_request` | a `rollout_batch`, a version, a side (trainer / rollout), `composition: original \| batch_invariant`, capture options | a workload request for the existing experiment stages that recomputes the batch at that version. It does not run it. |
+| `vectors.describe` | `event_ref`, `first_n` | per slot: shape, dtype, encoding, `vector_bytes`, `count`, zero count, the first N fingerprints with zero flags |
+| `vectors.lookup` | `fingerprint`, or `event_ref` + `slot` + `vector`; `scope` (runs, ranks, counter range) | every exact occurrence: run, rank, event, slot, vector, width, dtype (`same_vector_bytes`/`same_dtype` when queried by slot). Zero-fingerprint matches are returned apart, never as occurrences |
+| `vectors.coverage` | `event_ref`, `slot`, `scope` (null: the other run) | per vector: `occurs` (nonzero, same width and dtype), `absent` or `zero`, counts and first locations |
+| `vectors.compare` | two `event_ref` + `slot`, each with `token_dims` (leading dims whose product is T) and optional `token_ids` (e.g. forward `rows`) | per token row: `equal`, `equal_zero_only` (agreement carried only by zero fingerprints: no evidence) or `differ`, differing vector indices (same vector width) or merged row fingerprints (different vector width, same row bytes); `incompatible` when dtype or row bytes differ |
+| `rl.records_summary` | `records` | counts by type, batches with versions and trainer_logprob versions, forwards per rank, weight-sync and snapshot versions |
+| `rl.forwards` | `records`, `rank`, `counter_min`, `counter_max` | forward records in counter order with T, `token_ranks` and the observed `rows` (`row_layout: observed \| not_recorded`); `rows` can be passed as `token_ids` to `vectors.compare` |
+| `rl.decompose` | `records`, `batch_id`, `trainer_version` (the trainer's current version c), `policy_version_override` (null, or a version to assume for every token: a hypothesis) | `policy_version_source: recorded \| caller_supplied` (each token then keeps `recorded_policy_version`); `weights_check`: which weight-sync versions match the batch's recorded `weights_fingerprint` and whether its first labelled version does; per token: `numeric` and `staleness` with `value`, `exact` (false when the float64 shown is rounded), `zero` decided on bits (same dtype, same bits), `dtype_mismatch`; `staleness_zero_point`; `mixed_version`; the `path:line` of each record used; versions lacking `trainer_logprob` |
+| `rl.weight_sync_check` | `records`, `version` | per parameter on each side: rows, `unmatched_rows` (indices on that side), zero rows. Rows are matched as multisets of (width, dtype, fingerprint) across all parameters of the other side, so permuted, split or concatenated rows are not differences |
+| `rl.replay_request` | `records`, `batch_id`, `version`, `side`, `composition`, `capture` (`vector_fingerprints`, `env`), `output` | a replay request (sequences, weights location from `snapshot`, co-batching if original, engine flags, capture env) for your replay workload, launched offline through the experiment stages. It does not run it; `original` fails when no composition was recorded. The request carries `prompt_ids` when recorded and `runnable_alone` says whether prompts and weights are all present. `capture_path` says it assumes OpGuard's tracer: `capture_env` (`OPGUARD_XOR_ROWS=1`) has no effect on a replay that writes its own boundary records, which must compute vector fingerprints itself (`opguard.tracer.xor_signature.xor_vector_stats`). |
+
+Two trace actions serve the walk: `find_events` (artifact, literal `query` over
+the full `fn` and the event name, run, rank, counter range, cursor, limit) lists
+events and their io slots; `first_diff` also returns `call_sequences`, per rank the
+operations and forward markers of each run and the functions called a different
+number of times. When no diff is observed and the call counts differ, it says the
+silence is not evidence: order-based pairing cannot pair one trainer prefill with
+many engine forwards. Cross-shape comparison goes through `vectors.compare` under
+declared token dims; no matcher is built in.
+
+Arithmetic in `rl.decompose` is exact: differences are taken as rationals of the
+recorded values, so `gap = numeric + staleness` holds exactly; a value is
+`null` with a reason when a record is missing, and when two `trainer_logprob`
+records disagree on a token.
 
 `rl.replay_request` with `composition: batch_invariant` must say so in its
 result: such a replay localizes implementation differences, not the specific

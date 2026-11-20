@@ -12,6 +12,7 @@ from collections import defaultdict
 from opguard._running import get_output_subdir
 from opguard.utils.utils import get_id, register_signal_handler
 from opguard.tracer.source_files import get_collector, process_trace_stack
+from opguard.tracer.xor_signature import VECTOR_SCHEME, encode_xor_vectors
 import numpy as np
 import logging
 
@@ -347,6 +348,8 @@ class TraceBuffer:
 
     def finalize_io(self, obj):
         if isinstance(obj, dict):
+            if obj.get("scheme") == VECTOR_SCHEME:   # stats.xor_vectors: base64, never a list or scalar
+                return encode_xor_vectors(obj)
             return {k: self.finalize_io(v) for k, v in obj.items()}
         elif isinstance(obj, list):
             return [self.finalize_io(v) for v in obj]

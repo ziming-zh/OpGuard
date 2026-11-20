@@ -19,7 +19,7 @@ procedures. They are not a mandatory three-stage pipeline or separate agents.
 | [investigate-first-diff](../skills/investigate-first-diff/SKILL.md) | Run comparability, initial difference boundary, routing and evidence synthesis | Root-cause explanation or a clearly bounded inconclusive result |
 | [trace-upstream](../skills/trace-upstream/SKILL.md) | Following evidenced producers, mutations and dependencies backward | Narrowed causal boundary, candidate mechanism or missing observation |
 | [validate-hypothesis](../skills/validate-hypothesis/SKILL.md) | A discriminating test of one explicit candidate cause | Supported / refuted / inconclusive, with control and evidence |
-| [rl-alignment](../skills/rl-alignment/SKILL.md) | RL rollout/trainer parity: weight-sync check, staleness vs numeric split, offline localization and cause class (protocol draft: [RLAlignment.md](../../docs/RLAlignment.md)) | Split, localized operator and token on each side, or bounded inconclusive |
+| [rl-alignment](../skills/rl-alignment/SKILL.md) | RL rollout/trainer parity: weight-sync check, staleness vs numeric split, offline localization and cause class (protocol: [RLAlignment.md](../../docs/RLAlignment.md)) | Split, localized operator and token on each side, or bounded inconclusive |
 
 Start by asking your coding agent to read
 `harness/skills/investigate-first-diff/SKILL.md` from the repository root and investigate two identified captures.
@@ -46,7 +46,8 @@ currently launches discovery and tracing on both sides, not just one workload.
   explaining the result. The skills do not instruct agents to spawn subagents.
 - **Harness tools:** reliable queries and execution. Currently implemented tools
   cover experiment execution/status, trace/source queries, artifact-scoped
-  comparability reviews and rendering explicit alignment maps. Raw tensor comparison, producer-graph
+  comparability reviews, rendering explicit alignment maps, per-vector fingerprint
+  facts and RL record actions. Raw tensor comparison, producer-graph
   and targeted-capture APIs remain to be implemented.
 - **OpGuard:** instrumentation, trace collection, local staging/uploads and report
   generation through the versioned backend CLI.
@@ -146,6 +147,14 @@ SDK adapter can invoke this same boundary without changing execution logic.
 | `difference_candidates` | Page unreviewed differences or revisit previous judgments |
 | `review_pair` | Append an evidence-backed comparability judgment or declare a tensor boundary |
 | `render_alignment` | Freeze the map and render a new Perfetto view through OpGuard; no workload launch |
+| `vectors_describe` / `vectors_lookup` / `vectors_coverage` / `vectors_compare` | Exact per-vector fingerprint facts in an export: describe a slot, find a fingerprint, cover a slot on the other run, compare token rows under declared token dims |
+| `find_events` | Page events whose full `fn` or name contains a literal, by run, rank and counter range, with their io slots |
+| `rl_records_summary` / `rl_forwards` / `rl_decompose` / `rl_weight_sync_check` / `rl_replay_request` | RL harness records: list them and the forwards' observed row layout, split log-probability gaps exactly into numeric and staleness (optionally under a caller-supplied version, labelled as such, with a check of the batch's weights fingerprint), check weight syncs row by row, build (never run) a replay request |
+
+The `vectors_*` and `rl_*` tools also answer to their protocol names
+(`vectors.describe`, `rl.decompose`, ...). Training and rollout processes write the
+records with `opguard_harness.rl_records.RecordWriter`; see
+[RLAlignment.md](../../docs/RLAlignment.md) for the record schema and writer API.
 
 Typical interaction:
 
@@ -276,7 +285,9 @@ rank set; topology remapping is not implemented.
 Implemented: three diagnostic skills, supporting seven-stage execution, agent
 schemas/JSON CLI, bounded trace/source-context queries, attempt isolation,
 source restoration, per-rank finalization checks, comparability review history,
-explicit alignment-map rendering, errors and reports.
+explicit alignment-map rendering, per-vector fingerprint queries, RL harness
+records with exact log-probability decomposition, weight-sync checks and replay
+requests, errors and reports.
 
 The coding agent interprets the skills; there is no built-in chat loop or autonomous
 diagnosis engine. Raw tensor comparison, dynamic producer-graph queries and

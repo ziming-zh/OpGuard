@@ -3,7 +3,7 @@ import torch
 from collections import defaultdict
 import threading
 import numpy as np
-from opguard.tracer.xor_signature import xor_signature, xor_chunk_signature, flat_word_layout
+from opguard.tracer.xor_signature import xor_signature, xor_vector_stats, encode_xor_vectors, flat_word_layout
 from opguard.common_vars import ENABLE_CHECKSUM_NONCONTIG, OPGUARD_XOR_REGIONAL, OPGUARD_XOR_ROWS
 from opguard.utils.utils import placeholder_sig_from_meta
 
@@ -64,6 +64,7 @@ def summarize_tensor(t: torch.Tensor, verbosity="low", ignore_cpu=True) -> dict:
                 "numel": t.numel(),
                 "xor_signature": placeholder_sig_from_meta(t),  # uint32[1]
                 "xor_sig_mode": "placeholder-meta",
+                **(xor_vector_stats(t) if OPGUARD_XOR_ROWS else {}),
             },
             "requires_grad": bool(getattr(t, "requires_grad", False)),
             "is_leaf": bool(getattr(t, "is_leaf", False)),
@@ -81,6 +82,8 @@ def summarize_tensor(t: torch.Tensor, verbosity="low", ignore_cpu=True) -> dict:
     # If we can't byte-view and noncontig checksums are disabled, return early
     if not _can_view_as_bytes(t) and not ENABLE_CHECKSUM_NONCONTIG:
         base["type"] = "non-contiguous"
+        if OPGUARD_XOR_ROWS:
+            base["stats"]["xor_vectors_skipped"] = "non_contiguous"
         return base
 
     # XOR signature (robust to meta via try/fallback)
@@ -89,17 +92,18 @@ def summarize_tensor(t: torch.Tensor, verbosity="low", ignore_cpu=True) -> dict:
         base["stats"]["xor_signature"] = xor_signature(t, regional=regions, by="words")
         base["stats"]["xor_sig_mode"] = "bytes"
         base["stats"]["xor_sig_layout"] = flat_word_layout(t.numel() * t.element_size(), regions)
-        # Opt-in, for cross-stack alignment: one fingerprint per last-dim vector.
-        # No meaning is assumed here; token dims are found at compare time.
-        if OPGUARD_XOR_ROWS and t.dim() >= 1 and t.numel():
-            row_bytes = t.shape[-1] * t.element_size()
-            if row_bytes and row_bytes % 4 == 0:
-                base["stats"]["xor_rows"] = xor_chunk_signature(t, row_bytes)
-                base["stats"]["xor_row_bytes"] = row_bytes
+        # Opt-in, for cross-stack alignment: one fingerprint per last-dim vector
+        # (xor_vectors, lastdim-u32le-v1), launched on this stream and read back
+        # only when the summary is finalized. No meaning is assumed here; token
+        # dims are found at compare time.
+        if OPGUARD_XOR_ROWS:
+            base["stats"].update(xor_vector_stats(t))
     except RuntimeError as e:
         # e.g., “Cannot copy out of meta tensor” if something upstream passed Fake/Meta
         base["stats"]["xor_signature"] = placeholder_sig_from_meta(t)
         base["stats"]["xor_sig_mode"] = "placeholder-meta"
+        if OPGUARD_XOR_ROWS:
+            base["stats"]["xor_vectors_skipped"] = "meta"
 
     if verbosity == "low":
         return base
@@ -158,6 +162,8 @@ def finalize_summary(summary):
     stats = summary.get("stats", {})
     finalized = {}
     for k, v in stats.items():
+        if k == "xor_vectors":
+            v = encode_xor_vectors(v)
         finalized[k] = (v.cpu().item() if v.numel() == 1 else v.cpu().tolist()) if torch.is_tensor(v) else v
     summary["stats"] = finalized
     return summary

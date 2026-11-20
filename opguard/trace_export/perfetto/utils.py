@@ -86,6 +86,10 @@ def io_summary_with_xor_values(t: dict) -> Dict[str, Any]:
                 "xor_sig_layout": st.get("xor_sig_layout"),
                 "numel": st.get("numel"),
             })
+            # Opt-in per-vector fingerprints (and their legacy encoding) travel with
+            # the slot, so vector queries address event_ref + slot + vector index.
+            L[-1].update({k: st[k] for k in ("xor_vectors", "xor_vectors_skipped", "xor_rows", "xor_row_bytes")
+                          if k in st})
         return L
     return {
         "inputs": entries(_get(t, "inputs", "args")) + entries(_get(t, "inputs", "kwargs")),

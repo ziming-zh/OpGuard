@@ -1,4 +1,53 @@
-"""Interpret recorded regional fingerprints, without inferring value equality."""
+"""Interpret recorded regional and per-vector fingerprints, without inferring value equality."""
+import base64
+import struct
+
+VECTOR_SCHEME = 'lastdim-u32le-v1'
+
+
+def vector_fingerprints(tensor):
+    """Per-vector fingerprints of one recorded tensor, as unsigned 32-bit values.
+
+    Reads `xor_vectors` (lastdim-u32le-v1: base64 of little-endian uint32) and the
+    legacy `xor_rows` (signed int32 decimals, or one scalar for a single vector),
+    which is masked with 0xFFFFFFFF. Returns status `available` with
+    `vector_bytes`, `count` and `values`, `skipped` with the capture's reason, or
+    `unavailable`. A zero value is valid but never evidence, and values of
+    different `vector_bytes` are never comparable: the caller applies both.
+    """
+    shape = tensor.get('shape')
+    expected = last = None
+    if isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape):
+        expected, last = 1, (shape[-1] if shape else 1)
+        for n in shape[:-1]:
+            expected *= n
+    def result(encoding, width, values):
+        if (type(width) is not int or width < 4 or width % 4 or not values
+                or expected not in (None, len(values)) or (last and width % last)):
+            return {'status': 'unavailable', 'reason': 'vector_fingerprints_inconsistent_with_shape'}
+        return {'status': 'available', 'encoding': encoding, 'vector_bytes': width,
+                'count': len(values), 'values': values}
+    v1 = tensor.get('xor_vectors')
+    if v1 is not None:
+        if (not isinstance(v1, dict) or v1.get('scheme') != VECTOR_SCHEME
+                or v1.get('encoding') != 'base64-u32le' or not isinstance(v1.get('data'), str)):
+            return {'status': 'unavailable', 'reason': 'malformed_xor_vectors'}
+        try:
+            raw = base64.b64decode(v1['data'], validate=True)
+        except ValueError:
+            return {'status': 'unavailable', 'reason': 'malformed_xor_vectors'}
+        if len(raw) % 4 or v1.get('count') != len(raw) // 4:
+            return {'status': 'unavailable', 'reason': 'malformed_xor_vectors'}
+        return result(VECTOR_SCHEME, v1.get('vector_bytes'), struct.unpack('<%dI' % (len(raw) // 4), raw))
+    rows = tensor.get('xor_rows')
+    if rows is not None:
+        rows = rows if isinstance(rows, list) else [rows]
+        if any(type(v) not in (int, float) or not -2**31 <= v < 2**32 or v != int(v) for v in rows):
+            return {'status': 'unavailable', 'reason': 'malformed_legacy_xor_rows'}
+        return result('legacy-xor_rows', tensor.get('xor_row_bytes'), tuple(int(v) & 0xFFFFFFFF for v in rows))
+    if isinstance(tensor.get('xor_vectors_skipped'), str):
+        return {'status': 'skipped', 'reason': tensor['xor_vectors_skipped']}
+    return {'status': 'unavailable', 'reason': 'no_vector_fingerprints_recorded'}
 
 
 def _layout(tensor):

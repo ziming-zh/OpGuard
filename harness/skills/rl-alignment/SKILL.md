@@ -27,8 +27,9 @@ From records, configs and source, not assumption, collect the following:
 - each side's parallelism: TP, EP, SP;
 - model features that change numerics, such as linear attention or MoE.
 
-List which harness records exist: `forward`, `rollout_batch`, `trainer_logprob`,
-`weight_sync`, `snapshot`. If one you need is missing, say which and ask for it.
+List which harness records exist with `rl.records_summary`: `forward`,
+`rollout_batch`, `trainer_logprob`, `weight_sync`, `snapshot`. If one you need is
+missing, say which and ask for it.
 Label anything you infer instead (forward starts, token layout, routing) as
 inferred.
 
@@ -42,7 +43,12 @@ fixed.
 
 ## 2. Split staleness from numeric error
 
-Run `rl.decompose`. Prefer staleness-zero points (the batch's version equals the
+Run `rl.decompose` with the trainer's current version as `trainer_version` and
+`policy_version_override: null`. Read its `weights_check` first: when the batch's
+recorded weights fingerprint matches a different version's sync than its label,
+that is a bookkeeping lead (step 4). To test a version hypothesis, rerun with
+`policy_version_override`; the result is labelled `caller_supplied`, never
+observed. Prefer staleness-zero points (the batch's version equals the
 trainer's), which need no replay. Otherwise request a trainer replay at the
 recorded version with `rl.replay_request` (side `trainer`). Run it offline, and
 count it against the launch budget.
@@ -62,11 +68,20 @@ count it against the launch budget.
    mixed-version tokens.
 2. Request per-vector recapture (`OPGUARD_XOR_ROWS=1`) of that batch on both
    sides. Use `composition: original` when the batch composition was recorded.
+   Check `runnable_alone` (prompts and weights recorded). `capture_env` only
+   reaches OpGuard's tracer; a replay with its own boundary writer must compute
+   `xor_vectors` itself.
    Otherwise use `batch_invariant`, and state that the result then shows
    implementation differences, not this run's specific error.
-3. Take forward boundaries and token counts from `forward` records. Declare token
-   dims per tensor: leading dims whose product is T, or `token_ranks` when
-   sequence-sharded. Declare anything else as inferred.
+3. Take forward boundaries, token counts and, when recorded, each row's
+   `[seq_id, position]` from `rl.forwards`; pass `rows` as `token_ids` to
+   `vectors.compare` so rows pair by token. Declare token dims per tensor:
+   leading dims whose product is T, or `token_ranks` when sequence-sharded.
+   Declare anything else (a row layout without `rows`) as inferred. Find events
+   with `find_events` (search the full `fn`; event names are shortened).
+   `first_diff` cannot pair one trainer prefill with many engine forwards: when
+   its `call_sequences` show different call counts, its silence is not
+   agreement, and the comparison goes through `vectors.compare`.
 4. Anchor: find an early slot whose vectors agree on both sides, using
    `vectors.compare` or `vectors.coverage` (the embedding output usually does).
    Link tokens across sides only by fingerprints that belong to one token on each
@@ -78,6 +93,10 @@ count it against the launch budget.
      same width; or
    - a row of that token, with the same width, shares most vectors and differs
      in a few (this names the differing heads).
+
+   A fused producer (a qkv projection, a gate-up projection) has no partner of
+   its width: compare it at its first consumer after the split, where widths
+   match. A row marked `equal_zero_only` is no evidence either way.
 
    An unmatched row on its own is a gap: a step the other side fuses away or
    never captures. It is not a divergence. Follow the candidate's consumers

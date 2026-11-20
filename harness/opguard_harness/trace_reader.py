@@ -233,9 +233,62 @@ def first_diff(artifact):
                            'unaligned_before': len(unaligned),
                            'first_unaligned': trace.compact(unaligned[0]) if unaligned else None,
                            'alignment': trace.aligned(first) if first is not None else None})
-    return {'artifact': trace.identity(), 'boundaries': boundaries,
+    sequences = _call_counts(trace, groups)
+    silent = all(b['first_observed_diff'] is None for b in boundaries)
+    return {'artifact': trace.identity(), 'boundaries': boundaries, 'call_sequences': sequences,
+            **({'no_observed_diff_note': 'No exporter diff, but the runs made different numbers of calls on a rank, so '
+                                         'order-based pairing could not pair them: this silence is not evidence of '
+                                         'agreement. Compare across shapes with vectors_compare under declared token dims.'}
+               if silent and any(r['functions_with_different_call_counts'] for r in sequences) else {}),
             'scope': 'per_run_rank_export_order', 'root_cause': 'not_determined',
             'warning': 'Exporter pairs are candidates or agent assertions, not certified semantic equivalence. No observed diff is not proof of equivalence; previous OK is not necessarily a producer.'}
+
+
+def _call_counts(trace, groups):
+    """Per rank: operations, forward markers and the functions each run called a different number of times."""
+    by_rank = collections.defaultdict(dict)
+    for (run, rank), indices in groups.items():
+        by_rank[rank][run] = collections.Counter(trace.events[i]['args'].get('fn') for i in indices)
+    out = []
+    for rank, runs in sorted(by_rank.items(), key=lambda x: str(x[0])):
+        names = sorted(runs, key=str)
+        fns = sorted(set().union(*runs.values()), key=str)
+        differ = [{'fn': fn, 'calls': {str(r): runs[r][fn] for r in names}} for fn in fns
+                  if len({runs[r][fn] for r in names}) > 1]
+        out.append({'rank': rank, 'operations': {str(r): sum(runs[r].values()) for r in names},
+                    'forward_markers': {str(r): runs[r]['<opguard.forward>'] for r in names},
+                    'functions_with_different_call_counts': len(differ), 'examples': differ[:10]})
+    return out
+
+
+def find_events(artifact, query, run, rank, counter_min, counter_max, cursor, limit):
+    """Operation events whose fn or name contains a literal, in run/rank/counter order, paged."""
+    if query is not None and (not isinstance(query, str) or not query or len(query) > 200):
+        raise ValueError('query is null or a nonempty literal of at most 200 characters')
+    if type(cursor) is not int or cursor < 0 or type(limit) is not int or not 1 <= limit <= 200:
+        raise ValueError('cursor must be nonnegative and limit between 1 and 200')
+    trace = Trace(artifact)
+    def keep(i):
+        args = trace.events[i]['args']
+        c = args.get('counter')
+        text = f"{args.get('fn') or ''}\n{trace.events[i].get('name') or ''}"
+        return ((query is None or query in text) and (run is None or args.get('run') == run)
+                and (rank is None or args.get('rank') == rank)
+                and (counter_min is None or (type(c) is int and c >= counter_min))
+                and (counter_max is None or (type(c) is int and c <= counter_max)))
+    hits = sorted((i for i in trace.ops if keep(i)), key=lambda i: (
+        str(trace.events[i]['args'].get('run')), str(trace.events[i]['args'].get('rank')),
+        trace.events[i]['args'].get('counter') if type(trace.events[i]['args'].get('counter')) is int else 1 << 62, i))
+    page = []
+    for i in hits[cursor:cursor + limit]:
+        io = trace.events[i]['args'].get('io') or {}
+        slots = [{'slot': [side, j], 'shape': t.get('shape'), 'dtype': t.get('dtype'),
+                  'vectors': 'xor_vectors' in t or 'xor_rows' in t}
+                 for side in ('inputs', 'outputs') for j, t in enumerate(io.get(side) or []) if isinstance(t, dict)]
+        page.append({**trace.compact(i), 'slots': slots})
+    nxt = cursor + limit
+    return {'artifact': trace.identity(), 'events': page, 'match_count': len(hits),
+            'next_cursor': nxt if nxt < len(hits) else None, 'match': 'literal substring of fn or name'}
 
 
 def inspect_event(artifact, event_ref):
@@ -353,4 +406,4 @@ def code_context(artifact, source, line):
             'basis': 'embedded_source_context', 'runtime_branch_execution': 'not_established'}
 
 
-READERS = {fn.__name__: fn for fn in (trace_summary, first_diff, inspect_event, trace_neighbors, source_excerpt, search_source, compare_events, code_context)}
+READERS = {fn.__name__: fn for fn in (trace_summary, first_diff, find_events, inspect_event, trace_neighbors, source_excerpt, search_source, compare_events, code_context)}

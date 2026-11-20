@@ -1,6 +1,7 @@
 # xor_signature.py
 
 import torch, numpy as np
+import base64
 import sys
 from opguard.utils.utils import placeholder_sig_from_meta
 
@@ -153,6 +154,45 @@ def xor_chunk_signature(tensor: torch.Tensor, chunk_bytes: int, native: bool = T
             acc = torch.cat((acc, torch.zeros((acc.shape[0], 1), dtype=acc.dtype, device=acc.device)), dim=1)
         acc = torch.bitwise_xor(acc[:, 0::2], acc[:, 1::2])
     return acc[:, 0]
+
+
+VECTOR_SCHEME = "lastdim-u32le-v1"
+
+
+def xor_vector_stats(tensor: torch.Tensor, native: bool = True) -> dict:
+    """Per-vector fingerprints of the last dimension, as entries for a tensor's stats.
+
+    Format lastdim-u32le-v1 (docs/RLAlignment.md): vector k is the byte range
+    [k*vector_bytes, (k+1)*vector_bytes) of the flat little-endian buffer, where
+    vector_bytes = shape[-1] * element_size (a 0-dim tensor is one vector of one
+    element), and its fingerprint is the XOR of its 32-bit words. XOR-merging
+    consecutive vectors gives the flat-u32-le-v1 XOR of their byte range.
+
+    Returns {"xor_vectors": {...}}, whose "data" is still an int32[count] tensor on
+    the tensor's device (no host read here: encode_xor_vectors() makes it base64
+    where summaries are materialized), or {"xor_vectors_skipped": reason}.
+    """
+    if _is_meta_like(tensor):
+        return {"xor_vectors_skipped": "meta"}
+    if tensor.numel() == 0:
+        return {"xor_vectors_skipped": "empty"}
+    vector_bytes = (tensor.shape[-1] if tensor.dim() else 1) * tensor.element_size()
+    if vector_bytes % 4:
+        return {"xor_vectors_skipped": "vector_bytes_not_multiple_of_4"}
+    data = xor_chunk_signature(tensor, vector_bytes, native=native)
+    return {"xor_vectors": {"scheme": VECTOR_SCHEME, "vector_bytes": vector_bytes,
+                            "count": data.numel(), "encoding": "base64-u32le", "data": data}}
+
+
+def encode_xor_vectors(vectors: dict) -> dict:
+    """Materialize an xor_vectors object: its tensor becomes the base64 string of
+    count little-endian uint32 values. This is the host read, so it belongs where
+    summaries are finalized (the background writer), never on the operator's path."""
+    data = vectors.get("data")
+    if not torch.is_tensor(data):
+        return vectors
+    raw = data.detach().cpu().contiguous().numpy().astype("<i4", copy=False).tobytes()
+    return {**vectors, "data": base64.b64encode(raw).decode("ascii")}
 
 
 def xor_signature(

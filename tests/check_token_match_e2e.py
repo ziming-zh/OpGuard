@@ -13,6 +13,7 @@ import json, math, os, shutil, sys
 os.environ["OPGUARD_XOR_ROWS"] = "1"
 import torch
 from opguard.tracer.tensor_dump import summarize_tensor
+from opguard.tracer.xor_signature import VECTOR_SCHEME, encode_xor_vectors
 from opguard.trace_export.perfetto.token_match import main as token_main
 
 torch.manual_seed(0)
@@ -54,6 +55,8 @@ def attn(qn, kc, vc):             # one query row [NH, D] over its keys [L, NH, 
 
 def fin(o):
     if isinstance(o, dict):
+        if o.get("scheme") == VECTOR_SCHEME:
+            return encode_xor_vectors(o)
         return {k: fin(v) for k, v in o.items()}
     if isinstance(o, list):
         return [fin(v) for v in o]

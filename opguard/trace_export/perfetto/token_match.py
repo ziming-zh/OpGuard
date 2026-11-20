@@ -1,8 +1,9 @@
 """Cross-stack alignment by token chains (prototype).
 
 Needs captures taken with OPGUARD_XOR_ROWS=1 on both sides: each tensor then
-carries ``stats.xor_rows``, one XOR per vector of its last dimension. Capture
-assumes nothing about what a tensor means.
+carries ``stats.xor_vectors`` (lastdim-u32le-v1; older captures: ``stats.xor_rows``),
+one XOR per vector of its last dimension. Capture assumes nothing about what a
+tensor means.
 
 At compare time:
 1. Each side's trace is cut into forwards at the boundaries the OpGuard harness
@@ -36,7 +37,9 @@ Exact fingerprint equality only; an unlinked token or unmatched row is a gap.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import struct
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -82,15 +85,26 @@ def _leading(shape: List[int], n: int) -> Optional[int]:
     return None
 
 
+def _vectors(st: dict) -> Optional[List[int]]:
+    """Per-vector XORs as unsigned 32-bit values: ``xor_vectors`` (lastdim-u32le-v1,
+    base64) or the legacy ``xor_rows`` (signed decimals; a scalar for one vector)."""
+    v1 = st.get("xor_vectors")
+    if isinstance(v1, dict) and v1.get("scheme") == "lastdim-u32le-v1" and isinstance(v1.get("data"), str):
+        raw = base64.b64decode(v1["data"])
+        return list(struct.unpack("<%dI" % (len(raw) // 4), raw[:len(raw) // 4 * 4]))
+    raw = st.get("xor_rows")
+    if raw is None:
+        return None
+    return [int(v) & 0xFFFFFFFF for v in (raw if isinstance(raw, list) else [raw])]
+
+
 def _token_rows(t: dict, T: int):
     """Per token: (key, vectors). key = (elements per token, dtype, merged XOR), so rows
     of different widths never alias; vectors are the per-vector XORs (e.g. heads)."""
     st, shape = t["stats"], _shape(t)
-    raw = st.get("xor_rows")
+    raw = _vectors(st)
     if raw is None or shape is None:
         return None
-    if not isinstance(raw, list):
-        raw = [raw]
     k = _leading(shape, T)
     if k is None or len(raw) != _prod(shape[:-1]):
         return None
@@ -98,7 +112,7 @@ def _token_rows(t: dict, T: int):
     width, dtype = _prod(shape[k:]), _dtype(t)
     rows = []
     for i in range(T):
-        vecs = tuple(int(v) & 0xFFFFFFFF for v in raw[i * per:(i + 1) * per])
+        vecs = tuple(raw[i * per:(i + 1) * per])
         acc = 0
         for v in vecs:
             acc ^= v
